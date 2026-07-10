@@ -1,0 +1,41 @@
+# DT app local/generated files
+.dt-app/
+
+# Compiled output
+/dist
+/build
+/tmp
+
+# Deployment artifact
+/out
+
+# Dependencies
+/node_modules
+
+# Local/internal files
+dt_token.txt
+HANDOFF.md
+AGENTS.md
+CLAUDE.md
+
+# IDEs and editors
+/.idea
+*.iml
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+.history/
+
+# IDE - VSCode
+/.vscode/
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# app-settings plugin local files
+/settings/local-mock-data/secrets.json
+/settings/local-mock-data/persistence/

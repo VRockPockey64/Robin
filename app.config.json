@@ -1,0 +1,27 @@
+{
+  "$schema": "./.dt-app/app.config.schema.json",
+  "environmentUrl": "https://abc12345.apps.dynatrace.com/",
+  "app": {
+    "name": "Robin",
+    "version": "0.0.0",
+    "description": "Quality-of-life tools for observability teams.",
+    "id": "my.robin",
+    "scopes": [
+      { "name": "app-engine:functions:run", "comment": "Run the Robin backend functions." },
+      { "name": "storage:events:write", "comment": "Ingest custom business events through the current user's permissions." },
+      { "name": "storage:logs:write", "comment": "Ingest custom log records through the current user's permissions." },
+      { "name": "storage:logs:read", "comment": "Let the sample data page query ingested logs." },
+      { "name": "storage:smartscape:read", "comment": "Populate the Davis entity picker from Smartscape nodes." },
+      { "name": "storage:buckets:read", "comment": "Required for Grail queries in the sample data page." },
+      { "name": "automation:workflows:read", "comment": "Export existing workflows by ID." },
+      { "name": "automation:workflows:write", "comment": "Create workflows from pasted workflow JSON." },
+      { "name": "settings:objects:read", "comment": "Read existing Site Reliability Guardian settings objects before updates." },
+      { "name": "settings:objects:write", "comment": "Create and update Site Reliability Guardian settings objects." },
+      { "name": "settings:schemas:read", "comment": "Read Settings schema metadata for Site Reliability Guardian permissions." },
+      { "name": "storage:system:read", "comment": "Search recent users from dt.system.events for dashboard ownership transfer." },
+      { "name": "document:documents:read", "comment": "Read dashboard metadata before transferring ownership." },
+      { "name": "document:documents:write", "comment": "Transfer dashboard ownership with the Documents API." },
+      { "name": "document:documents:admin", "comment": "Allow admin dashboard ownership transfer for documents the user does not own." }
+    ]
+  }
+}
