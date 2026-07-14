@@ -787,7 +787,7 @@ function validateRecords(records: LibraryRecord[]) {
 
       if (hasCityStreetDiff) {
         addIssue(issues, {
-          actualValue: `city=${city} | street=${street}`,
+          actualValue: street,
           field: "street",
           location: `payloads[${index}].street`,
           message:
@@ -882,7 +882,7 @@ function validateRecords(records: LibraryRecord[]) {
 
       if (hasCityCriticalityDiff) {
         addIssue(issues, {
-          actualValue: `city=${city} | criticality=${criticality}`,
+          actualValue: criticality,
           field: "criticality",
           location: `payloads[${index}].criticality`,
           message:
@@ -931,7 +931,7 @@ function validateRecords(records: LibraryRecord[]) {
 
       if (hasMappingDiff(streetCriticalityDiff)) {
         addIssue(issues, {
-          actualValue: `street=${street} | criticality=${criticality}`,
+          actualValue: criticality,
           field: "criticality",
           location: `payloads[${index}].criticality`,
           message:
@@ -1185,9 +1185,12 @@ export const Wccs = () => {
   const [states, setStates] = useState<Record<string, IssueState>>({});
   const [copyStatus, setCopyStatus] = useState("");
   const [editorScrollTop, setEditorScrollTop] = useState(0);
+  const [highlightedLine, setHighlightedLine] = useState<number>();
   const [approvedSignature, setApprovedSignature] = useState("");
+  const editorShellRef = useRef<HTMLLabelElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const copyStatusTimer = useRef<number>();
+  const highlightTimer = useRef<number>();
   const loggedAuditResultRef = useRef("");
 
   const parseResult = useMemo(() => parseLibrary(sourceCode), [sourceCode]);
@@ -1294,6 +1297,12 @@ export const Wccs = () => {
       )}.`,
     );
   }, [auditData, log]);
+  useEffect(
+    () => () => {
+      window.clearTimeout(highlightTimer.current);
+    },
+    [],
+  );
   const outputApproved =
     auditData?.ok === true && approvedSignature === approvalSignature && !auditError;
   const canApproveOutput = parseResult.records.length > 0 && unresolvedCount === 0;
@@ -1340,8 +1349,26 @@ export const Wccs = () => {
     }
 
     const scrollTop = Math.max(0, (lineNumber - 4) * editorLineHeight);
-    editorRef.current.focus();
-    editorRef.current.scrollTop = scrollTop;
+    editorShellRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+
+    window.clearTimeout(highlightTimer.current);
+    setHighlightedLine(lineNumber);
+    highlightTimer.current = window.setTimeout(
+      () => setHighlightedLine(undefined),
+      3500,
+    );
+
+    window.setTimeout(() => {
+      if (!editorRef.current) {
+        return;
+      }
+
+      editorRef.current.focus();
+      editorRef.current.scrollTop = scrollTop;
+    }, 150);
     setEditorScrollTop(scrollTop);
   };
 
@@ -1373,7 +1400,7 @@ export const Wccs = () => {
 
       <Flex flexDirection="column" gap={24} style={{ ...panelStyle, ...styles.panel }}>
         <Heading level={2}>Library Validator</Heading>
-        <label style={{ display: "grid", gap: 6 }}>
+        <label ref={editorShellRef} style={{ display: "grid", gap: 6 }}>
           <Strong>Paste GitHub library code or JSON</Strong>
           <div
             style={{
@@ -1405,11 +1432,29 @@ export const Wccs = () => {
               }}
             >
               <div style={{ transform: `translateY(-${editorScrollTop}px)` }}>
-                {lineNumbers.map((lineNumber) => (
-                  <div key={lineNumber} style={{ height: editorLineHeight }}>
-                    {lineNumber}
-                  </div>
-                ))}
+                {lineNumbers.map((lineNumber) => {
+                  const highlighted = lineNumber === highlightedLine;
+
+                  return (
+                    <div
+                      key={lineNumber}
+                      style={{
+                        background: highlighted
+                          ? theme === "dark"
+                            ? "#f7d84a"
+                            : "#ffe66d"
+                          : "transparent",
+                        borderRadius: 4,
+                        color: highlighted ? "#111323" : undefined,
+                        fontWeight: highlighted ? 700 : undefined,
+                        height: editorLineHeight,
+                        paddingRight: 2,
+                      }}
+                    >
+                      {lineNumber}
+                    </div>
+                  );
+                })}
               </div>
             </div>
             <textarea
