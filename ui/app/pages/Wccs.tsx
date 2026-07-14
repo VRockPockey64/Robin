@@ -487,12 +487,121 @@ function streetSuffixPartsForMatchingCity(value: string, cities: string[]) {
     .filter(Boolean);
 }
 
+function cityKeyFromStreet(value: string, cities: string[]) {
+  const matchingCity = cities.find((city) => value.startsWith(`${city}_`));
+
+  if (matchingCity) {
+    return matchingCity;
+  }
+
+  const parts = value
+    .split("_")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  return parts.length >= 2 ? `${parts[0]}_${parts[1]}` : value.trim();
+}
+
 function looksLikeCriticality(value: string) {
   return /_(?:LOW|MEDIUM|HIGH|ULTRA)$/i.test(value.trim());
 }
 
 function severityToken(value: string) {
   return /_(LOW|MEDIUM|HIGH|ULTRA)$/i.exec(value.trim())?.[1].toUpperCase();
+}
+
+function cityKeyFromCriticality(value: string, cities: string[]) {
+  const matchingCity = cities.find((city) => value.startsWith(`${city}_`));
+
+  if (matchingCity) {
+    return matchingCity;
+  }
+
+  const severity = severityToken(value);
+  const valueWithoutSeverity = severity
+    ? value.trim().slice(0, -`_${severity}`.length)
+    : value.trim();
+  const parts = valueWithoutSeverity
+    .split("_")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  return parts.length >= 2 ? `${parts[0]}_${parts[1]}` : valueWithoutSeverity;
+}
+
+function countValues(values: string[]) {
+  const counts = new Map<string, number>();
+
+  for (const value of values.filter(Boolean)) {
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
+function mappingDiff(referenceValues: string[], relatedValues: string[]) {
+  const referenceCounts = countValues(referenceValues);
+  const relatedCounts = countValues(relatedValues);
+  const referenceKeys = [...referenceCounts.keys()];
+  const relatedKeys = [...relatedCounts.keys()];
+
+  return {
+    duplicateReference: referenceKeys.filter(
+      (key) => (referenceCounts.get(key) ?? 0) > 1,
+    ),
+    duplicateRelated: relatedKeys.filter((key) => (relatedCounts.get(key) ?? 0) > 1),
+    missingInReference: relatedKeys.filter((key) => !referenceCounts.has(key)),
+    missingInRelated: referenceKeys.filter((key) => !relatedCounts.has(key)),
+  };
+}
+
+function hasMappingDiff(diff: ReturnType<typeof mappingDiff>) {
+  return (
+    diff.duplicateReference.length > 0 ||
+    diff.duplicateRelated.length > 0 ||
+    diff.missingInReference.length > 0 ||
+    diff.missingInRelated.length > 0
+  );
+}
+
+function formatDiffValues(values: string[]) {
+  return values.length > 0 ? values.join(", ") : "none";
+}
+
+function mappingDiffMessage(
+  referenceLabel: string,
+  relatedLabel: string,
+  diff: ReturnType<typeof mappingDiff>,
+) {
+  const details: string[] = [];
+
+  if (diff.missingInReference.length > 0) {
+    details.push(
+      `${formatDiffValues(diff.missingInReference)} present in ${relatedLabel} but missing from ${referenceLabel}`,
+    );
+  }
+
+  if (diff.missingInRelated.length > 0) {
+    details.push(
+      `${formatDiffValues(diff.missingInRelated)} present in ${referenceLabel} but missing from ${relatedLabel}`,
+    );
+  }
+
+  if (diff.duplicateReference.length > 0) {
+    details.push(
+      `${formatDiffValues(diff.duplicateReference)} appears more than once in ${referenceLabel}`,
+    );
+  }
+
+  if (diff.duplicateRelated.length > 0) {
+    details.push(
+      `${formatDiffValues(diff.duplicateRelated)} appears more than once in ${relatedLabel}`,
+    );
+  }
+
+  return details.length > 0
+    ? details.join(". ") + "."
+    : `${relatedLabel} must map one-to-one with ${referenceLabel}.`;
 }
 
 function validateRecords(records: LibraryRecord[]) {
@@ -670,23 +779,31 @@ function validateRecords(records: LibraryRecord[]) {
     }
 
     if (country && cityValues.length > 0 && street) {
-      const streetCardinalityValid = streetValues.length === cityValues.length;
+      const streetCityKeys = streetValues.map((streetValue) =>
+        cityKeyFromStreet(streetValue, cityValues),
+      );
+      const cityStreetDiff = mappingDiff(cityValues, streetCityKeys);
+      const hasCityStreetDiff = hasMappingDiff(cityStreetDiff);
 
-      if (!streetCardinalityValid) {
+      if (hasCityStreetDiff) {
         addIssue(issues, {
-          actualValue: street,
+          actualValue: `city=${city} | street=${street}`,
           field: "street",
           location: `payloads[${index}].street`,
           message:
-            "Street must have a 1:1 mapping with city. Provide exactly one street value for each city value.",
+            `Street must have a 1:1 mapping with city. ${mappingDiffMessage(
+              "city",
+              "street",
+              cityStreetDiff,
+            )}`,
           recordIndex: index,
-          rule: "city-street-cardinality",
+          rule: "city-street-mapping",
           severity: "error",
           suggestedValue: cityValues.map((cityValue) => `${cityValue}_street`).join(","),
         });
       }
 
-      if (streetCardinalityValid) {
+      if (!hasCityStreetDiff) {
         for (const streetValue of streetValues) {
           if (!startsWithAnyCity(streetValue, cityValues)) {
             addIssue(issues, {
@@ -754,24 +871,34 @@ function validateRecords(records: LibraryRecord[]) {
       });
     }
 
-    if (cityValues.length > 0 && criticality) {
-      const criticalityCardinalityValid = criticalityValues.length === cityValues.length;
+    let hasCityCriticalityDiff = false;
 
-      if (!criticalityCardinalityValid) {
+    if (cityValues.length > 0 && criticality) {
+      const criticalityCityKeys = criticalityValues.map((criticalityValue) =>
+        cityKeyFromCriticality(criticalityValue, cityValues),
+      );
+      const cityCriticalityDiff = mappingDiff(cityValues, criticalityCityKeys);
+      hasCityCriticalityDiff = hasMappingDiff(cityCriticalityDiff);
+
+      if (hasCityCriticalityDiff) {
         addIssue(issues, {
-          actualValue: criticality,
+          actualValue: `city=${city} | criticality=${criticality}`,
           field: "criticality",
           location: `payloads[${index}].criticality`,
           message:
-            "Criticality must have a 1:1 mapping with city. Provide exactly one criticality value for each city value.",
+            `Criticality must have a 1:1 mapping with city. ${mappingDiffMessage(
+              "city",
+              "criticality",
+              cityCriticalityDiff,
+            )}`,
           recordIndex: index,
-          rule: "city-criticality-cardinality",
+          rule: "city-criticality-mapping",
           severity: "error",
           suggestedValue: cityValues.map((cityValue) => `${cityValue}_HIGH`).join(","),
         });
       }
 
-      if (criticalityCardinalityValid) {
+      if (!hasCityCriticalityDiff) {
         for (const cityValue of cityValues) {
           const matchingCriticalities = valuesForCity(criticalityValues, cityValue);
 
@@ -793,6 +920,36 @@ function validateRecords(records: LibraryRecord[]) {
       }
     }
 
+    if (cityValues.length > 0 && street && criticality) {
+      const streetCityKeys = streetValues.map((streetValue) =>
+        cityKeyFromStreet(streetValue, cityValues),
+      );
+      const criticalityCityKeys = criticalityValues.map((criticalityValue) =>
+        cityKeyFromCriticality(criticalityValue, cityValues),
+      );
+      const streetCriticalityDiff = mappingDiff(streetCityKeys, criticalityCityKeys);
+
+      if (hasMappingDiff(streetCriticalityDiff)) {
+        addIssue(issues, {
+          actualValue: `street=${street} | criticality=${criticality}`,
+          field: "criticality",
+          location: `payloads[${index}].criticality`,
+          message:
+            `Criticality must have a 1:1 mapping with street. ${mappingDiffMessage(
+              "street",
+              "criticality",
+              streetCriticalityDiff,
+            )}`,
+          recordIndex: index,
+          rule: "street-criticality-mapping",
+          severity: "error",
+          suggestedValue: streetValues
+            .map((streetValue) => `${cityKeyFromStreet(streetValue, cityValues)}_HIGH`)
+            .join(","),
+        });
+      }
+    }
+
     const invalidCriticalitySeverity = criticalityValues.find(
       (criticalityValue) => !severityToken(criticalityValue),
     );
@@ -810,7 +967,7 @@ function validateRecords(records: LibraryRecord[]) {
       });
     }
 
-    if (cityValues.length > 0 && criticality) {
+    if (cityValues.length > 0 && criticality && !hasCityCriticalityDiff) {
       for (const criticalityValue of criticalityValues) {
         const criticalitySeverity = severityToken(criticalityValue);
 
@@ -1029,6 +1186,7 @@ export const Wccs = () => {
   const [copyStatus, setCopyStatus] = useState("");
   const [editorScrollTop, setEditorScrollTop] = useState(0);
   const [approvedSignature, setApprovedSignature] = useState("");
+  const editorRef = useRef<HTMLTextAreaElement>(null);
   const copyStatusTimer = useRef<number>();
   const loggedAuditResultRef = useRef("");
 
@@ -1176,6 +1334,17 @@ export const Wccs = () => {
     return defaultText;
   };
 
+  const jumpToLine = (lineNumber?: number) => {
+    if (!lineNumber || !editorRef.current) {
+      return;
+    }
+
+    const scrollTop = Math.max(0, (lineNumber - 4) * editorLineHeight);
+    editorRef.current.focus();
+    editorRef.current.scrollTop = scrollTop;
+    setEditorScrollTop(scrollTop);
+  };
+
   const approveOutput = async () => {
     if (!canApproveOutput || auditIsLoading) {
       return;
@@ -1244,6 +1413,7 @@ export const Wccs = () => {
               </div>
             </div>
             <textarea
+              ref={editorRef}
               autoCapitalize="off"
               autoComplete="off"
               autoCorrect="off"
@@ -1336,17 +1506,36 @@ export const Wccs = () => {
                       ...issueStyle,
                       borderRadius: 6,
                       boxSizing: "border-box",
+                      display: "flex",
+                      gap: 12,
+                      justifyContent: "space-between",
                       marginBottom: 12,
                       padding: 10,
                     }}
                   >
-                    <Strong>
-                      Error {issueIndex + 1}
-                      {issue.lineNumber ? ` | Line ${issue.lineNumber}` : ""}
-                      {` | ${issue.location}`}
-                      {` - ${issueStatus}`}
-                    </Strong>
-                    <Paragraph>{issue.message}</Paragraph>
+                    <div>
+                      <Strong>
+                        Error {issueIndex + 1}
+                        {issue.lineNumber ? ` | Line ${issue.lineNumber}` : ""}
+                        {` | ${issue.location}`}
+                        {` - ${issueStatus}`}
+                      </Strong>
+                      <Paragraph>{issue.message}</Paragraph>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={!issue.lineNumber}
+                      onClick={() => jumpToLine(issue.lineNumber)}
+                      style={{
+                        ...buttonStyle,
+                        ...styles.idleButton,
+                        ...(!issue.lineNumber ? disabledButtonStyle : {}),
+                        alignSelf: "start",
+                        flex: "0 0 auto",
+                      }}
+                    >
+                      Go to line
+                    </button>
                   </div>
 
                   <div
