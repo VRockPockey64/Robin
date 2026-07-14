@@ -9,8 +9,15 @@ const SRG_SCHEMA_ID = "app:dynatrace.site.reliability.guardian:guardians";
 type SrgRequest = {
   action?: "export" | "save" | "validate";
   body?: unknown;
+  credential?: unknown;
   id?: unknown;
   validateOnly?: unknown;
+};
+
+type SrgCredential = {
+  environmentUrl?: string;
+  mode: "accessToken" | "app";
+  token?: string;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -37,6 +44,21 @@ function parseSrgRequest(payload: unknown) {
 
 function parseRequest(payload: unknown): SrgRequest {
   return isRecord(payload) ? payload : {};
+}
+
+function parseCredential(value: unknown): SrgCredential {
+  if (!isRecord(value)) {
+    return { mode: "app" };
+  }
+
+  const mode = value.mode === "accessToken" ? "accessToken" : "app";
+  const token = typeof value.token === "string" ? value.token.trim() : undefined;
+  const environmentUrl =
+    typeof value.environmentUrl === "string"
+      ? value.environmentUrl.trim()
+      : undefined;
+
+  return { environmentUrl, mode, token };
 }
 
 function getStringField(body: Record<string, unknown>, key: string) {
@@ -190,6 +212,117 @@ function requireSuccessfulCreateResponse(
   return first;
 }
 
+function normalizeEnvironmentApiUrl(url: string) {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  return trimmed.replace(".apps.dynatrace.com", ".live.dynatrace.com");
+}
+
+function requireTokenCredential(credential: SrgCredential) {
+  if (credential.mode !== "accessToken") {
+    return undefined;
+  }
+
+  if (!credential.token) {
+    throw new Error("A Dynatrace access token is required for token mode.");
+  }
+
+  if (!credential.environmentUrl) {
+    throw new Error("Environment API URL is required for token mode.");
+  }
+
+  return {
+    environmentUrl: normalizeEnvironmentApiUrl(credential.environmentUrl),
+    token: credential.token,
+  };
+}
+
+async function readEnvironmentApiResponse(response: Response) {
+  const text = await response.text();
+  let body: unknown = text;
+
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
+
+  if (!response.ok) {
+    const message =
+      isRecord(body) && typeof body.message === "string"
+        ? body.message
+        : typeof body === "string" && body
+          ? body
+          : response.statusText;
+    const error = new Error(`HTTP ${response.status}: ${message}`);
+    (error as Error & { response?: unknown }).response = body;
+    throw error;
+  }
+
+  return body;
+}
+
+function requireTokenCreateResponse(response: unknown) {
+  if (!Array.isArray(response)) {
+    return response;
+  }
+
+  const first = response[0];
+  if (!isRecord(first)) {
+    throw new Error(`SRG create failed: ${JSON.stringify(response, null, 2)}`);
+  }
+
+  const code = typeof first.code === "number" ? first.code : 200;
+  if (code >= 400 || first.error) {
+    throw new Error(`SRG create failed: ${JSON.stringify(first, null, 2)}`);
+  }
+
+  return first;
+}
+
+function objectIdFromResponse(response: unknown) {
+  return isRecord(response) && typeof response.objectId === "string"
+    ? response.objectId
+    : undefined;
+}
+
+async function fetchSettingsObject({
+  body,
+  environmentUrl,
+  method,
+  objectId,
+  token,
+  validateOnly,
+}: {
+  body?: unknown;
+  environmentUrl: string;
+  method: "GET" | "POST" | "PUT";
+  objectId?: string;
+  token: string;
+  validateOnly?: boolean;
+}) {
+  const objectPath = objectId ? `/${encodeURIComponent(objectId)}` : "";
+  const url = new URL(`${environmentUrl}/api/v2/settings/objects${objectPath}`);
+
+  if (method !== "GET") {
+    url.searchParams.set("validateOnly", validateOnly ? "true" : "false");
+  }
+  url.searchParams.set("adminAccess", "false");
+
+  const response = await fetch(url.toString(), {
+    body: body === undefined ? undefined : JSON.stringify(body),
+    headers: {
+      Accept: "application/json",
+      Authorization: `Api-Token ${token}`,
+      "Content-Type": "application/json",
+    },
+    method,
+  });
+
+  return readEnvironmentApiResponse(response);
+}
+
 async function upsertSrg(body: Record<string, unknown>) {
   const objectId = getStringField(body, "objectId");
 
@@ -221,6 +354,49 @@ async function upsertSrg(body: Record<string, unknown>) {
   return {
     action: "created" as const,
     objectId: created.objectId,
+    response: created,
+  };
+}
+
+async function upsertSrgWithToken(
+  body: Record<string, unknown>,
+  credential: Required<Pick<SrgCredential, "environmentUrl" | "token">>,
+) {
+  const objectId = getStringField(body, "objectId");
+
+  if (objectId) {
+    try {
+      const response = await fetchSettingsObject({
+        body: toUpdateBody(body),
+        environmentUrl: credential.environmentUrl,
+        method: "PUT",
+        objectId,
+        token: credential.token,
+      });
+
+      return {
+        action: "updated" as const,
+        objectId: objectIdFromResponse(response) ?? objectId,
+        response,
+      };
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  const response = await fetchSettingsObject({
+    body: [toCreateBody(body)],
+    environmentUrl: credential.environmentUrl,
+    method: "POST",
+    token: credential.token,
+  });
+  const created = requireTokenCreateResponse(response);
+
+  return {
+    action: "created" as const,
+    objectId: objectIdFromResponse(created),
     response: created,
   };
 }
@@ -261,14 +437,84 @@ async function validateSrg(body: Record<string, unknown>) {
   };
 }
 
+async function validateSrgWithToken(
+  body: Record<string, unknown>,
+  credential: Required<Pick<SrgCredential, "environmentUrl" | "token">>,
+) {
+  const objectId = getStringField(body, "objectId");
+
+  if (objectId) {
+    try {
+      const response = await fetchSettingsObject({
+        body: toUpdateBody(body),
+        environmentUrl: credential.environmentUrl,
+        method: "PUT",
+        objectId,
+        token: credential.token,
+        validateOnly: true,
+      });
+
+      return {
+        action: "validated" as const,
+        objectId: objectIdFromResponse(response) ?? objectId,
+        response,
+      };
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  const response = await fetchSettingsObject({
+    body: [toCreateBody(body)],
+    environmentUrl: credential.environmentUrl,
+    method: "POST",
+    token: credential.token,
+    validateOnly: true,
+  });
+  const validated = requireTokenCreateResponse(response);
+
+  return {
+    action: "validated" as const,
+    objectId: objectIdFromResponse(validated) ?? objectId,
+    response: validated,
+  };
+}
+
 export default async function (payload: unknown = undefined) {
   const request = parseRequest(payload);
+  const credential = parseCredential(request.credential);
 
   try {
+    const tokenCredential = requireTokenCredential(credential);
+
     if (request.action === "export") {
       const objectId = getStringField({ id: request.id }, "id");
       if (!objectId) {
         throw new Error("SRG object ID is required for export.");
+      }
+
+      if (tokenCredential) {
+        const guardian = await fetchSettingsObject({
+          environmentUrl: tokenCredential.environmentUrl,
+          method: "GET",
+          objectId,
+          token: tokenCredential.token,
+        });
+        const guardianRecord = isRecord(guardian) ? guardian : {};
+        const value = isRecord(guardianRecord.value) ? guardianRecord.value : {};
+        const name =
+          typeof value.name === "string" ? value.name : "Site Reliability Guardian";
+
+        return {
+          action: "exported",
+          apiPayload: { objectId },
+          objectId: objectIdFromResponse(guardian) ?? objectId,
+          name,
+          note: "SRG exported with the Environment Settings API using the provided access token. The token was not stored.",
+          response: guardian,
+        };
       }
 
       const guardian = await settingsObjectsClient.getSettingsObjectByObjectId({
@@ -291,10 +537,17 @@ export default async function (payload: unknown = undefined) {
     const createPayload = toCreateBody(body);
     const { action, objectId, response } =
       request.action === "validate" || request.validateOnly === true
-        ? await validateSrg(body)
-        : await upsertSrg(body);
+        ? tokenCredential
+          ? await validateSrgWithToken(body, tokenCredential)
+          : await validateSrg(body)
+        : tokenCredential
+          ? await upsertSrgWithToken(body, tokenCredential)
+          : await upsertSrg(body);
     const value = isRecord(body.value) ? body.value : body;
     const name = typeof value.name === "string" ? value.name : "Site Reliability Guardian";
+    const authNote = tokenCredential
+      ? "using the Environment Settings API with the provided access token. The token was not stored."
+      : "using the current user's app permissions.";
 
     return {
       action,
@@ -303,10 +556,10 @@ export default async function (payload: unknown = undefined) {
       name,
       note:
         action === "updated"
-          ? "SRG updated with settingsObjectsClient.putSettingsObjectByObjectId using the current user's app permissions."
+          ? `SRG updated ${authNote}`
           : action === "validated"
-            ? "SRG JSON validated with the Settings API validateOnly option. No SRG was saved."
-          : "SRG created with settingsObjectsClient.postSettingsObjects using the current user's app permissions.",
+            ? `SRG JSON validated with the Settings API validateOnly option ${authNote} No SRG was saved.`
+          : `SRG created ${authNote}`,
       response,
     };
   } catch (error) {

@@ -16,6 +16,7 @@ type IngestKind = "log" | "bizevent" | "davis-event" | "davis-problem";
 type AppTab = "ingest" | "workflow" | "srg";
 type WorkflowPageMode = "import" | "export";
 type SrgPageMode = "import" | "export";
+type SrgCredentialMode = "accessToken" | "app";
 
 type HomeProps = {
   activeTab?: AppTab;
@@ -374,6 +375,12 @@ function openDynatraceAppPath(path: string) {
   window.open(`${environmentUrl}${path}`, "_blank", "noopener,noreferrer");
 }
 
+function defaultEnvironmentApiUrl() {
+  return getEnvironmentUrl()
+    .replace(/\/+$/, "")
+    .replace(".apps.dynatrace.com", ".live.dynatrace.com");
+}
+
 function checklistComplete(checklist: SafetyChecklist) {
   return Object.values(checklist).every(Boolean);
 }
@@ -442,6 +449,12 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
     '{\n  "schemaId": "app:dynatrace.site.reliability.guardian:guardians",\n  "schemaVersion": "1.9.1",\n  "scope": "environment",\n  "value": {\n    "name": "Robin guardian from JSON",\n    "tags": [],\n    "variables": [],\n    "objectives": [\n      {\n        "name": "Logs",\n        "objectiveType": "DQL",\n        "dqlQuery": "fetch logs\\n| summarize count = count()",\n        "comparisonOperator": "LESS_THAN_OR_EQUAL",\n        "target": 500,\n        "segments": [],\n        "links": []\n      }\n    ],\n    "eventKind": "BIZ_EVENT"\n  }\n}',
   );
   const [srgMode, setSrgMode] = useState<SrgPageMode>("import");
+  const [srgCredentialMode, setSrgCredentialMode] =
+    useState<SrgCredentialMode>("app");
+  const [srgAccessToken, setSrgAccessToken] = useState("");
+  const [srgEnvironmentApiUrl, setSrgEnvironmentApiUrl] = useState(
+    defaultEnvironmentApiUrl,
+  );
   const [srgExportId, setSrgExportId] = useState("");
   const [srgValidateOnly, setSrgValidateOnly] = useState(true);
   const [srgChecklist, setSrgChecklist] =
@@ -572,6 +585,15 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
         action:
           srgMode === "export" ? "export" : srgValidateOnly ? "validate" : "save",
         body: srgBody,
+        credential: {
+          environmentUrl:
+            srgCredentialMode === "accessToken"
+              ? srgEnvironmentApiUrl
+              : undefined,
+          mode: srgCredentialMode,
+          token:
+            srgCredentialMode === "accessToken" ? srgAccessToken : undefined,
+        },
         id: srgExportId,
         validateOnly: srgValidateOnly,
       },
@@ -765,6 +787,17 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
     }
 
     setSrgChecklistMessage("");
+    if (
+      srgCredentialMode === "accessToken" &&
+      (!srgAccessToken.trim() || !srgEnvironmentApiUrl.trim())
+    ) {
+      setSrgChecklistMessage(
+        "Enter an Environment API URL and a Dynatrace access token before running SRG token mode.",
+      );
+      log("warn", "SRG", "SRG token mode blocked because credentials are incomplete.");
+      return;
+    }
+
     const srgValue = srgBody?.value;
     const srgName =
       stringField(srgBody ?? {}, "summary") ||
@@ -778,11 +811,15 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
     log(
       "info",
       "SRG",
-      srgMode === "export"
-        ? `Exporting SRG ${srgExportId || "(missing ID)"}.`
+      `${srgMode === "export"
+        ? `Exporting SRG ${srgExportId || "(missing ID)"}`
         : srgValidateOnly
-          ? `Validating SRG "${srgName}".`
-          : `Creating or updating SRG "${srgName}".`,
+          ? `Validating SRG "${srgName}"`
+          : `Creating or updating SRG "${srgName}"`} ${
+        srgCredentialMode === "accessToken"
+          ? "with a provided access token."
+          : "with app permissions."
+      }`,
     );
     void saveSrg();
   };
@@ -1444,6 +1481,81 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
             ))}
           </Flex>
 
+          <Flex
+            flexDirection="column"
+            gap={12}
+            style={{ ...panelStyle, ...styles.panel, boxSizing: "border-box", width: "100%" }}
+          >
+            <Heading level={3}>Execution method</Heading>
+            <Flex gap={8} flexFlow="wrap" style={{ ...styles.segment, borderRadius: 8, padding: 6, width: "fit-content" }}>
+              {(["app", "accessToken"] as SrgCredentialMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => {
+                    setSrgCredentialMode(mode);
+                    setCopyStatus("");
+                  }}
+                  style={{
+                    ...buttonStyle,
+                    ...(srgCredentialMode === mode
+                      ? styles.selectedButton
+                      : styles.idleButton),
+                  }}
+                >
+                  {mode === "app" ? "Current app permissions" : "DT access token"}
+                  {srgCredentialMode === mode ? "  Selected" : ""}
+                </button>
+              ))}
+            </Flex>
+
+            {srgCredentialMode === "accessToken" ? (
+              <Flex flexDirection="column" gap={12}>
+                <label style={{ display: "grid", gap: 6 }}>
+                  <Strong>Environment API base URL</Strong>
+                  <input
+                    value={srgEnvironmentApiUrl}
+                    onChange={(event) =>
+                      setSrgEnvironmentApiUrl(event.target.value)
+                    }
+                    placeholder="https://zuy24864.live.dynatrace.com"
+                    spellCheck={false}
+                    style={{ ...fieldStyle, ...styles.field }}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 6 }}>
+                  <Strong>Dynatrace access token</Strong>
+                  <input
+                    autoComplete="off"
+                    value={srgAccessToken}
+                    onChange={(event) => setSrgAccessToken(event.target.value)}
+                    placeholder="Paste a classic access token with settings.read/settings.write"
+                    spellCheck={false}
+                    style={{ ...fieldStyle, ...styles.field }}
+                    type="password"
+                  />
+                </label>
+                <Flex alignItems="center" gap={12} justifyContent="space-between" flexFlow="wrap">
+                  <Paragraph style={helpTextStyle}>
+                    Token mode uses the Environment Settings API for this request only.
+                    The token is not stored, logged, copied into previews, or returned in the response.
+                  </Paragraph>
+                  <button
+                    type="button"
+                    onClick={() => setSrgAccessToken("")}
+                    style={{ ...buttonStyle, ...styles.idleButton }}
+                  >
+                    Clear token
+                  </button>
+                </Flex>
+              </Flex>
+            ) : (
+              <Paragraph style={helpTextStyle}>
+                Uses Robin app permissions through the Dynatrace SDK. This is the default path for tenants where the app has the needed Settings scopes.
+              </Paragraph>
+            )}
+          </Flex>
+
           {srgMode === "import" ? (
             <>
               <label style={{ display: "grid", gap: 6 }}>
@@ -1526,7 +1638,9 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
               disabled={
                 srgIsLoading ||
                 (srgMode === "import" && !srgJsonIsValid) ||
-                (srgMode === "export" && !srgExportId.trim())
+                (srgMode === "export" && !srgExportId.trim()) ||
+                (srgCredentialMode === "accessToken" &&
+                  (!srgAccessToken.trim() || !srgEnvironmentApiUrl.trim()))
               }
               onClick={submitSrg}
               style={{

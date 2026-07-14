@@ -480,6 +480,13 @@ function suffixForMatchingCity(value: string, cities: string[]) {
   return city ? streetSuffix(city, value) : value;
 }
 
+function streetSuffixPartsForMatchingCity(value: string, cities: string[]) {
+  return suffixForMatchingCity(value, cities)
+    .split("_")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
 function looksLikeCriticality(value: string) {
   return /_(?:LOW|MEDIUM|HIGH|ULTRA)$/i.test(value.trim());
 }
@@ -723,20 +730,27 @@ function validateRecords(records: LibraryRecord[]) {
         return false;
       }
 
-      return suffixForMatchingCity(streetValue, cityValues).includes("_");
+      return streetSuffixPartsForMatchingCity(streetValue, cityValues).length > 2;
     });
 
     if (extraLayerStreet) {
+      const allowedStreetSuffix = streetSuffixPartsForMatchingCity(
+        extraLayerStreet,
+        cityValues,
+      )
+        .slice(0, 2)
+        .join("_");
+
       addIssue(issues, {
         actualValue: extraLayerStreet,
         field: "street",
         location: `payloads[${index}].street`,
         message:
-          "Street must follow exactly `<country>_<city>_<street>` with no extra underscore layer after the street value.",
+          "Street must follow `<country>_<city>_<street>` and may include one optional extra segment, like `<country>_<city>_<street>_<detail>`.",
         recordIndex: index,
         rule: "street-no-extra-layer",
         severity: "error",
-        suggestedValue: `${cityValues[0]}_${suffixForMatchingCity(extraLayerStreet, cityValues).split("_")[0]}`,
+        suggestedValue: `${cityValues[0]}_${allowedStreetSuffix}`,
       });
     }
 
