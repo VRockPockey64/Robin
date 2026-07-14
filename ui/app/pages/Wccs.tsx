@@ -67,7 +67,27 @@ type ValidationSummary = {
   unresolvedCount: number;
 };
 
-const sampleLibrary = `const payloads = [
+type LibraryKind = "service" | "slo";
+
+type LibraryConfig = {
+  description: string;
+  navLabel: string;
+  recordStartField: string;
+  requiredFields: string[];
+  sample: string;
+  title: string;
+};
+
+type HighServiceWarning = {
+  criticality: string;
+  id: string;
+  lineNumber?: number;
+  location: string;
+  recordIndex: number;
+  serviceName: string;
+};
+
+const sampleServiceLibrary = `const payloads = [
   {
     "serviceName": "Retail-Core-Service",
     "type": "SERVICE",
@@ -161,6 +181,79 @@ const sampleLibrary = `const payloads = [
 ];
 
 return payloads;`;
+
+const sampleSloLibrary = `const payloads = [
+  {
+    "eventName": "Retail Login 5xx Errors Count",
+    "type": "SERVICE",
+    "serviceName": "Retail-Web",
+    "world": "Retail_Banking",
+    "country": "WEB",
+    "city": "WEB_login,WEB_OTP",
+    "street": "WEB_login_channel_app,WEB_OTP_channel_app",
+    "criticality": "WEB_login_MEDIUM,WEB_OTP_MEDIUM"
+  },
+  {
+    "eventName": "SLO:L2 Availability - Retail Login",
+    "type": "SERVICE",
+    "serviceName": "Retail-Core-Service",
+    "world": "Retail_Banking",
+    "country": "WEB",
+    "city": "WEB_login",
+    "street": "WEB_login_app",
+    "criticality": "WEB_login_HIGH"
+  },
+  {
+    "eventName": "SLO:L2 Performance - Retail Login",
+    "type": "SERVICE",
+    "serviceName": "Retail-Core-Service",
+    "world": "Retail_Banking",
+    "country": "WEB",
+    "city": "WEB_login",
+    "street": "WEB_login_app",
+    "criticality": "WEB_login_MEDIUM"
+  }
+];
+
+return payloads;`;
+
+const libraryConfigs: Record<LibraryKind, LibraryConfig> = {
+  service: {
+    description:
+      "Validate WCCS service library payloads before promoting GitHub changes into Dynatrace workflows.",
+    navLabel: "Service Library Validator",
+    recordStartField: "serviceName",
+    requiredFields: [
+      "serviceName",
+      "type",
+      "world",
+      "country",
+      "city",
+      "street",
+      "criticality",
+    ],
+    sample: sampleServiceLibrary,
+    title: "Service Library Validator",
+  },
+  slo: {
+    description:
+      "Validate WCCS SLO library payloads, event-to-service mappings, and HIGH criticality service mappings.",
+    navLabel: "SLO Library Validator",
+    recordStartField: "eventName",
+    requiredFields: [
+      "eventName",
+      "type",
+      "serviceName",
+      "world",
+      "country",
+      "city",
+      "street",
+      "criticality",
+    ],
+    sample: sampleSloLibrary,
+    title: "SLO Library Validator",
+  },
+};
 
 const fieldStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -604,18 +697,61 @@ function mappingDiffMessage(
     : `${relatedLabel} must map one-to-one with ${referenceLabel}.`;
 }
 
-function validateRecords(records: LibraryRecord[]) {
+function trackGroupedValue(
+  map: Map<string, Map<string, number[]>>,
+  key: string,
+  value: string,
+  index: number,
+) {
+  const valueMap = map.get(key) ?? new Map<string, number[]>();
+  const seen = valueMap.get(value) ?? [];
+
+  seen.push(index);
+  valueMap.set(value, seen);
+  map.set(key, valueMap);
+}
+
+function validateGroupedConsistency(
+  issues: Issue[],
+  map: Map<string, Map<string, number[]>>,
+  options: {
+    field: string;
+    locationField: string;
+    message: (key: string, details: string) => string;
+    rule: string;
+  },
+) {
+  for (const [key, valueMap] of map) {
+    if (valueMap.size <= 1) {
+      continue;
+    }
+
+    const details = [...valueMap.entries()]
+      .map(([value, indexes]) => `${value} at payloads[${indexes.join(", ")}]`)
+      .join("; ");
+
+    for (const [value, indexes] of valueMap) {
+      for (const index of indexes) {
+        addIssue(issues, {
+          actualValue: value,
+          field: options.field,
+          location: `payloads[${index}].${options.locationField}`,
+          message: options.message(key, details),
+          recordIndex: index,
+          rule: options.rule,
+          severity: "error",
+        });
+      }
+    }
+  }
+}
+
+function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
   const issues: Issue[] = [];
-  const requiredFields = [
-    "serviceName",
-    "type",
-    "world",
-    "country",
-    "city",
-    "street",
-    "criticality",
-  ];
+  const requiredFields = libraryConfigs[libraryKind].requiredFields;
   const serviceTypes = new Map<string, Map<string, number[]>>();
+  const eventServices = new Map<string, Map<string, number[]>>();
+  const eventTypes = new Map<string, Map<string, number[]>>();
   const worlds = new Map<string, number[]>();
   let hasInvalidWorldField = false;
 
@@ -639,6 +775,7 @@ function validateRecords(records: LibraryRecord[]) {
     const criticality = stringField(record, "criticality");
     const cityValues = splitCommaValues(city);
     const criticalityValues = splitCommaValues(criticality);
+    const eventName = stringField(record, "eventName");
     const serviceName = stringField(record, "serviceName");
     const street = stringField(record, "street");
     const streetValues = splitCommaValues(street);
@@ -682,12 +819,26 @@ function validateRecords(records: LibraryRecord[]) {
       worlds.set(world, seen);
     }
 
-    if (serviceName && type && !emptyCommaFields.has("type") && !typeHasSingleValueError) {
-      const typeMap = serviceTypes.get(serviceName) ?? new Map<string, number[]>();
-      const seen = typeMap.get(type) ?? [];
-      seen.push(index);
-      typeMap.set(type, seen);
-      serviceTypes.set(serviceName, typeMap);
+    if (
+      libraryKind === "service" &&
+      serviceName &&
+      type &&
+      !emptyCommaFields.has("type") &&
+      !typeHasSingleValueError
+    ) {
+      trackGroupedValue(serviceTypes, serviceName, type, index);
+    }
+
+    if (
+      libraryKind === "slo" &&
+      eventName &&
+      serviceName &&
+      type &&
+      !emptyCommaFields.has("type") &&
+      !typeHasSingleValueError
+    ) {
+      trackGroupedValue(eventServices, eventName, serviceName, index);
+      trackGroupedValue(eventTypes, eventName, type, index);
     }
 
     if (worldHasSingleValueError) {
@@ -1000,28 +1151,32 @@ function validateRecords(records: LibraryRecord[]) {
     });
   }
 
-  for (const [serviceName, typeMap] of serviceTypes) {
-    if (typeMap.size <= 1) {
-      continue;
-    }
+  if (libraryKind === "service") {
+    validateGroupedConsistency(issues, serviceTypes, {
+      field: "type",
+      locationField: "type",
+      message: (serviceName, details) =>
+        `Service \`${serviceName}\` has conflicting type values across records: ${details}.`,
+      rule: "service-type-conflict",
+    });
+  }
 
-    const details = [...typeMap.entries()]
-      .map(([type, indexes]) => `${type} at payloads[${indexes.join(", ")}]`)
-      .join("; ");
+  if (libraryKind === "slo") {
+    validateGroupedConsistency(issues, eventServices, {
+      field: "serviceName",
+      locationField: "serviceName",
+      message: (eventName, details) =>
+        `Event \`${eventName}\` maps to multiple serviceName values: ${details}. EventName/serviceName must remain consistent.`,
+      rule: "slo-event-service-conflict",
+    });
 
-    for (const [type, indexes] of typeMap) {
-      for (const index of indexes) {
-        addIssue(issues, {
-          actualValue: type,
-          field: "type",
-          location: `payloads[${index}].type`,
-          message: `Service \`${serviceName}\` has conflicting type values across records: ${details}.`,
-          recordIndex: index,
-          rule: "service-type-conflict",
-          severity: "error",
-        });
-      }
-    }
+    validateGroupedConsistency(issues, eventTypes, {
+      field: "type",
+      locationField: "type",
+      message: (eventName, details) =>
+        `Event \`${eventName}\` has conflicting type values: ${details}. EventName/type must remain consistent.`,
+      rule: "slo-event-type-conflict",
+    });
   }
 
   return issues;
@@ -1047,12 +1202,13 @@ function buildReport(
   parseResult: ParseResult,
   validationIssues: Issue[],
   states: Record<string, IssueState>,
+  title = "WCCS library",
 ) {
   const summary = buildValidationSummary(parseResult, validationIssues, states);
   const allIssues = [...parseResult.issues, ...validationIssues];
 
   return [
-    "WCCS library validation report",
+    `${title} validation report`,
     `Source kind: ${summary.sourceKind}`,
     `Records parsed: ${summary.recordsParsed}`,
     `Issues found: ${summary.issueCount}`,
@@ -1124,6 +1280,12 @@ function locateIssueLine(source: string, issue: Issue) {
   }
 
   const lines = source.split(/\r\n|\r|\n/);
+  const recordStartField =
+    source.includes('"eventName"') ||
+    source.includes("'eventName'") ||
+    source.includes("eventName:")
+      ? "eventName"
+      : "serviceName";
   let currentRecord = -1;
   let currentRecordStart = 1;
   let firstFieldLine: number | undefined;
@@ -1133,7 +1295,7 @@ function locateIssueLine(source: string, issue: Issue) {
     const line = lines[index];
     const lineNumber = index + 1;
 
-    if (lineContainsField(line, "serviceName")) {
+    if (lineContainsField(line, recordStartField)) {
       currentRecord += 1;
       currentRecordStart = lineNumber;
     }
@@ -1177,11 +1339,55 @@ function issueWithLine(source: string, issue: Issue): Issue {
   };
 }
 
+function getHighServiceWarnings(
+  records: LibraryRecord[],
+  source: string,
+): HighServiceWarning[] {
+  return records.flatMap((record, index) => {
+    const criticality = stringField(record, "criticality");
+    const serviceName = stringField(record, "serviceName");
+
+    if (
+      !serviceName ||
+      !splitCommaValues(criticality).some(
+        (criticalityValue) => severityToken(criticalityValue) === "HIGH",
+      )
+    ) {
+      return [];
+    }
+
+    const location = `payloads[${index}].serviceName`;
+    const lineNumber = locateIssueLine(source, {
+      actualValue: serviceName,
+      field: "serviceName",
+      id: `high-service-${index}`,
+      location,
+      message: "",
+      recordIndex: index,
+      rule: "high-service-review",
+      severity: "warning",
+    });
+
+    return [
+      {
+        criticality,
+        id: `${index}:${serviceName}:${criticality}`,
+        lineNumber,
+        location,
+        recordIndex: index,
+        serviceName,
+      },
+    ];
+  });
+}
+
 export const Wccs = () => {
   const theme = useCurrentTheme();
   const styles = getThemeStyles(theme);
   const { log } = useAppConsole();
-  const [sourceCode, setSourceCode] = useState(sampleLibrary);
+  const [libraryKind, setLibraryKind] = useState<LibraryKind>("service");
+  const activeConfig = libraryConfigs[libraryKind];
+  const [sourceCode, setSourceCode] = useState(libraryConfigs.service.sample);
   const [states, setStates] = useState<Record<string, IssueState>>({});
   const [copyStatus, setCopyStatus] = useState("");
   const [editorScrollTop, setEditorScrollTop] = useState(0);
@@ -1202,10 +1408,10 @@ export const Wccs = () => {
         .join("\n"),
     [parseResult.issues],
   );
-  useConsoleError("WCCS Library Validator", parseErrorMessage);
+  useConsoleError(activeConfig.title, parseErrorMessage);
   const validationIssues = useMemo(
-    () => validateRecords(parseResult.records),
-    [parseResult.records],
+    () => validateRecords(parseResult.records, libraryKind),
+    [libraryKind, parseResult.records],
   );
   const allIssues = useMemo(
     () =>
@@ -1228,12 +1434,20 @@ export const Wccs = () => {
     [parseResult, validationIssues, states],
   );
   const report = useMemo(
-    () => buildReport(parseResult, validationIssues, states),
-    [parseResult, validationIssues, states],
+    () => buildReport(parseResult, validationIssues, states, activeConfig.title),
+    [activeConfig.title, parseResult, validationIssues, states],
+  );
+  const highServiceWarnings = useMemo(
+    () =>
+      libraryKind === "slo"
+        ? getHighServiceWarnings(parseResult.records, sourceCode)
+        : [],
+    [libraryKind, parseResult.records, sourceCode],
   );
   const auditPayload = useMemo(
     () => ({
       approvalStatement,
+      highCriticalityServiceWarnings: highServiceWarnings,
       issueCount: allIssues.length,
       issues: allIssues.map((issue) => ({
         actualValue: issue.actualValue,
@@ -1255,6 +1469,8 @@ export const Wccs = () => {
       })),
       recordsParsed: validationSummary.recordsParsed,
       report,
+      libraryKind,
+      libraryName: activeConfig.title,
       sourceKind: parseResult.sourceKind,
       validationSummary,
       unresolvedCount,
@@ -1262,6 +1478,9 @@ export const Wccs = () => {
     [
       allIssues,
       approvalStatement,
+      activeConfig.title,
+      highServiceWarnings,
+      libraryKind,
       parseResult.sourceKind,
       report,
       states,
@@ -1311,6 +1530,27 @@ export const Wccs = () => {
     () => sourceCode.split(/\r\n|\r|\n/).map((_line, index) => index + 1),
     [sourceCode],
   );
+
+  const selectLibraryKind = (nextLibraryKind: LibraryKind) => {
+    if (nextLibraryKind === libraryKind) {
+      return;
+    }
+
+    const nextConfig = libraryConfigs[nextLibraryKind];
+
+    setLibraryKind(nextLibraryKind);
+    setSourceCode(nextConfig.sample);
+    setStates({});
+    setCopyStatus("");
+    setEditorScrollTop(0);
+    setHighlightedLine(undefined);
+    setApprovedSignature("");
+    loggedAuditResultRef.current = "";
+
+    if (editorRef.current) {
+      editorRef.current.scrollTop = 0;
+    }
+  };
 
   const copyText = (label: string, value: string) => {
     if (label === "Output" && !outputApproved) {
@@ -1393,13 +1633,33 @@ export const Wccs = () => {
       <Flex flexDirection="column" gap={8} style={panelStyle}>
         <Heading>WCCS</Heading>
         <Paragraph>
-          Validate WCCS service library payloads before promoting GitHub changes
-          into Dynatrace workflows.
+          Validate WCCS library payloads before promoting GitHub changes into
+          Dynatrace workflows.
         </Paragraph>
       </Flex>
 
       <Flex flexDirection="column" gap={24} style={{ ...panelStyle, ...styles.panel }}>
-        <Heading level={2}>Library Validator</Heading>
+        <Flex gap={8} flexWrap="wrap">
+          {(Object.entries(libraryConfigs) as Array<[LibraryKind, LibraryConfig]>).map(
+            ([kind, config]) => (
+              <button
+                key={kind}
+                type="button"
+                onClick={() => selectLibraryKind(kind)}
+                style={{
+                  ...buttonStyle,
+                  ...(libraryKind === kind ? styles.primaryButton : styles.idleButton),
+                }}
+              >
+                {config.navLabel}
+              </button>
+            ),
+          )}
+        </Flex>
+        <Flex flexDirection="column" gap={6}>
+          <Heading level={2}>{activeConfig.title}</Heading>
+          <Paragraph>{activeConfig.description}</Paragraph>
+        </Flex>
         <label ref={editorShellRef} style={{ display: "grid", gap: 6 }}>
           <Strong>Paste GitHub library code or JSON</Strong>
           <div
@@ -1661,6 +1921,89 @@ export const Wccs = () => {
             })
           )}
         </Flex>
+
+        {libraryKind === "slo" && (
+          <Flex flexDirection="column" gap={12}>
+            <Heading level={3}>High criticality service review</Heading>
+            {highServiceWarnings.length === 0 ? (
+              <div
+                style={{
+                  ...styles.success,
+                  borderRadius: 6,
+                  boxSizing: "border-box",
+                  padding: 12,
+                }}
+              >
+                <Strong>No HIGH criticality service mappings found.</Strong>
+              </div>
+            ) : (
+              <div
+                style={{
+                  ...styles.panel,
+                  borderRadius: 8,
+                  boxSizing: "border-box",
+                  overflowX: "auto",
+                  padding: 12,
+                }}
+              >
+                <table
+                  style={{
+                    borderCollapse: "collapse",
+                    minWidth: 780,
+                    width: "100%",
+                  }}
+                >
+                  <thead>
+                    <tr>
+                      {["Line", "Service name", "Criticality", "Action"].map(
+                        (heading) => (
+                          <th
+                            key={heading}
+                            style={{
+                              borderBottom:
+                                theme === "dark"
+                                  ? "1px solid #3b3d55"
+                                  : "1px solid #d8dae5",
+                              padding: "8px 10px",
+                              textAlign: "left",
+                            }}
+                          >
+                            <Strong>{heading}</Strong>
+                          </th>
+                        ),
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {highServiceWarnings.map((warning) => (
+                      <tr key={warning.id}>
+                        <td style={{ padding: "8px 10px" }}>
+                          {warning.lineNumber ? `Line ${warning.lineNumber}` : "N/A"}
+                        </td>
+                        <td style={{ padding: "8px 10px" }}>{warning.serviceName}</td>
+                        <td style={{ padding: "8px 10px" }}>{warning.criticality}</td>
+                        <td style={{ padding: "8px 10px" }}>
+                          <button
+                            type="button"
+                            disabled={!warning.lineNumber}
+                            onClick={() => jumpToLine(warning.lineNumber)}
+                            style={{
+                              ...buttonStyle,
+                              ...styles.idleButton,
+                              ...(!warning.lineNumber ? disabledButtonStyle : {}),
+                            }}
+                          >
+                            Go to line
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Flex>
+        )}
 
         <Flex flexDirection="column" gap={8} style={{ ...styles.panel, borderRadius: 8, padding: 12 }}>
           <Flex flexDirection="column" gap={8}>
