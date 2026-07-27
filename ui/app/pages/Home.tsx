@@ -1405,7 +1405,7 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
                   ...(srgMode === mode ? styles.selectedButton : styles.idleButton),
                 }}
               >
-                {mode === "import" ? "Import SRG" : "Export SRG"}
+                {mode === "import" ? "Create SRG" : "Download SRG"}
                 {srgMode === mode ? "  Selected" : ""}
               </button>
             ))}
@@ -1433,7 +1433,7 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
                       : styles.idleButton),
                   }}
                 >
-                  {mode === "app" ? "Current app permissions" : "DT access token"}
+                  {mode === "app" ? "SDK access" : "DT access token"}
                   {srgCredentialMode === mode ? "  Selected" : ""}
                 </button>
               ))}
@@ -1481,7 +1481,7 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
               </Flex>
             ) : (
               <Paragraph style={helpTextStyle}>
-                Uses Robin app permissions through the Dynatrace SDK. This is the default path for tenants where the app has the needed Settings scopes.
+                Uses the Dynatrace developer SDK with Robin app permissions. Manifest scopes used here: settings:objects:read, settings:objects:write, settings:schemas:read. Direct token mode uses classic Settings API scopes such as settings.read and settings.write.
               </Paragraph>
             )}
           </Flex>
@@ -1581,10 +1581,10 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
               {srgIsLoading
                 ? "Working..."
                 : srgMode === "export"
-                  ? "Export SRG"
+                  ? "Download SRG"
                   : srgValidateOnly
                     ? "Validate SRG"
-                    : "Create or update SRG"}
+                    : "Create SRG"}
             </button>
           </Flex>
           {srgChecklistMessage && renderWarning(srgChecklistMessage)}
