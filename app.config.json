@@ -14,7 +14,6 @@
       { "name": "storage:smartscape:read", "comment": "Populate the Davis entity picker from Smartscape nodes." },
       { "name": "storage:buckets:read", "comment": "Required for Grail queries in the sample data page." },
       { "name": "automation:workflows:read", "comment": "Export existing workflows by ID." },
-      { "name": "automation:workflows:write", "comment": "Create workflows from pasted workflow JSON." },
       { "name": "settings:objects:read", "comment": "Read existing Site Reliability Guardian settings objects before updates." },
       { "name": "settings:objects:write", "comment": "Create and update Site Reliability Guardian settings objects." },
       { "name": "settings:schemas:read", "comment": "Read Settings schema metadata for Site Reliability Guardian permissions." },

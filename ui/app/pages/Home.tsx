@@ -8,13 +8,13 @@ import {
   Strong,
 } from "@dynatrace/strato-components/typography";
 import { getEnvironmentUrl } from "@dynatrace-sdk/app-environment";
-import { getIntentLink } from "@dynatrace-sdk/navigation";
+import { getIntentLink, sendIntent } from "@dynatrace-sdk/navigation";
 import { useAppFunction, useDql } from "@dynatrace-sdk/react-hooks";
 import { useAppConsole, useConsoleError } from "../components/AppConsole";
 
 type IngestKind = "log" | "bizevent" | "davis-event" | "davis-problem";
 type AppTab = "ingest" | "workflow" | "srg";
-type WorkflowPageMode = "import" | "export";
+type WorkflowPageMode = "create" | "download";
 type SrgPageMode = "import" | "export";
 type SrgCredentialMode = "accessToken" | "app";
 
@@ -48,13 +48,6 @@ type SrgResult = {
   name: string;
   note: string;
   response: unknown;
-};
-
-type SafetyChecklist = {
-  prodEntityIds: boolean;
-  workflowActor: boolean;
-  privateOrPublic: boolean;
-  lowerEnvValidated: boolean;
 };
 
 type DavisOptions = {
@@ -146,19 +139,6 @@ const ingestKindLabels: Record<IngestKind, string> = {
 const eventCategories = ["", "INFO", "AVAILABILITY", "ERROR", "RESOURCE", "PERFORMANCE"];
 const muteStatuses = ["", "NOT_MUTED", "MUTED"];
 const impactLevels = ["", "Environment", "Infrastructure", "Services", "Applications"];
-const checklistLabels: Record<keyof SafetyChecklist, string> = {
-  prodEntityIds: "Production entity IDs are verified",
-  workflowActor: "Workflow actor is verified",
-  privateOrPublic: "Private/public visibility is verified",
-  lowerEnvValidated: "Validated in lower environment",
-};
-
-const emptyChecklist: SafetyChecklist = {
-  prodEntityIds: false,
-  workflowActor: false,
-  privateOrPublic: false,
-  lowerEnvValidated: false,
-};
 
 function escapeDqlString(value: string) {
   return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
@@ -381,10 +361,6 @@ function defaultEnvironmentApiUrl() {
     .replace(".apps.dynatrace.com", ".live.dynatrace.com");
 }
 
-function checklistComplete(checklist: SafetyChecklist) {
-  return Object.values(checklist).every(Boolean);
-}
-
 function pageTitle(activeTab: AppTab) {
   if (activeTab === "workflow") {
     return "Workflow";
@@ -395,6 +371,18 @@ function pageTitle(activeTab: AppTab) {
   }
 
   return "Ingest telemetry";
+}
+
+function pageDescription(activeTab: AppTab) {
+  if (activeTab === "workflow") {
+    return "";
+  }
+
+  if (activeTab === "srg") {
+    return "Create, validate, or download Site Reliability Guardians using app permissions or a Dynatrace access token.";
+  }
+
+  return "Send sample logs, business events, and Davis events through Robin.";
 }
 
 function isSmartscapeEntity(value: unknown): value is SmartscapeEntity {
@@ -437,14 +425,10 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
   const copyStatusTimer = useRef<number>();
   const [submittedKind, setSubmittedKind] = useState<IngestKind>();
   const [workflowJson, setWorkflowJson] = useState(
-    '{\n  "title": "Robin workflow from JSON",\n  "description": "Created from Robin",\n  "isDeployed": false\n}',
+    '{\n  "title": "Robin workflow from JSON",\n  "tasks": {}\n}',
   );
-  const [workflowMode, setWorkflowMode] = useState<WorkflowPageMode>("import");
+  const [workflowMode, setWorkflowMode] = useState<WorkflowPageMode>("create");
   const [workflowExportId, setWorkflowExportId] = useState("");
-  const [workflowValidateOnly, setWorkflowValidateOnly] = useState(true);
-  const [workflowChecklist, setWorkflowChecklist] =
-    useState<SafetyChecklist>(emptyChecklist);
-  const [workflowChecklistMessage, setWorkflowChecklistMessage] = useState("");
   const [srgJson, setSrgJson] = useState(
     '{\n  "schemaId": "app:dynatrace.site.reliability.guardian:guardians",\n  "schemaVersion": "1.9.1",\n  "scope": "environment",\n  "value": {\n    "name": "Robin guardian from JSON",\n    "tags": [],\n    "variables": [],\n    "objectives": [\n      {\n        "name": "Logs",\n        "objectiveType": "DQL",\n        "dqlQuery": "fetch logs\\n| summarize count = count()",\n        "comparisonOperator": "LESS_THAN_OR_EQUAL",\n        "target": 500,\n        "segments": [],\n        "links": []\n      }\n    ],\n    "eventKind": "BIZ_EVENT"\n  }\n}',
   );
@@ -457,8 +441,6 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
   );
   const [srgExportId, setSrgExportId] = useState("");
   const [srgValidateOnly, setSrgValidateOnly] = useState(true);
-  const [srgChecklist, setSrgChecklist] =
-    useState<SafetyChecklist>(emptyChecklist);
   const [srgChecklistMessage, setSrgChecklistMessage] = useState("");
   const loggedIngestResultRef = useRef("");
   const loggedWorkflowResultRef = useRef("");
@@ -542,20 +524,15 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
     data: workflowData,
     error: workflowError,
     isLoading: workflowIsLoading,
-    refetch: createWorkflow,
+    refetch: downloadWorkflow,
   } = useAppFunction<WorkflowResult>(
     {
       name: "workflow",
       data: {
-        action:
-          workflowMode === "export"
-            ? "export"
-            : workflowValidateOnly
-              ? "validate"
-              : "save",
+        action: workflowMode === "download" ? "export" : "validate",
         body: workflowBody,
         id: workflowExportId,
-        validateOnly: workflowValidateOnly,
+        validateOnly: true,
       },
     },
     { autoFetch: false, autoFetchOnUpdate: false },
@@ -742,50 +719,52 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
 
   const submitWorkflow = () => {
     setCopyStatus("");
-    if (
-      workflowMode === "import" &&
-      !workflowValidateOnly &&
-      !checklistComplete(workflowChecklist)
-    ) {
-      setWorkflowChecklistMessage(
-        "Check all pre-flight checklist items before creating or updating a workflow.",
-      );
+
+    if (workflowMode === "create") {
+      if (!workflowBody) {
+        log(
+          "warn",
+          "Workflow",
+          "Workflow JSON must be valid before opening the create intent.",
+        );
+        return;
+      }
+
+      const workflowTitle = stringField(workflowBody, "title") || "untitled";
       log(
-        "warn",
+        "info",
         "Workflow",
-        "Pre-flight checklist blocked workflow create/update.",
+        `Opening Workflows create intent for "${workflowTitle}".`,
       );
+      try {
+        sendIntent(
+          workflowBody as Record<string, unknown>,
+          "dynatrace.automations",
+          "create-workflow",
+        );
+        log(
+          "info",
+          "Workflow",
+          `Opened Workflows create intent for "${workflowTitle}".`,
+        );
+      } catch (intentError) {
+        const message =
+          intentError instanceof Error ? intentError.message : String(intentError);
+        log("error", "Workflow", `Could not open workflow create intent: ${message}`);
+      }
       return;
     }
 
-    setWorkflowChecklistMessage("");
-    const workflowTitle = stringField(workflowBody ?? {}, "title") || "untitled";
     log(
       "info",
       "Workflow",
-      workflowMode === "export"
-        ? `Exporting workflow ${workflowExportId || "(missing ID)"}.`
-        : workflowValidateOnly
-          ? `Validating workflow "${workflowTitle}".`
-          : `Creating or updating workflow "${workflowTitle}".`,
+      `Downloading workflow ${workflowExportId || "(missing ID)"}.`,
     );
-    void createWorkflow();
+    void downloadWorkflow();
   };
 
   const submitSrg = () => {
     setCopyStatus("");
-    if (
-      srgMode === "import" &&
-      !srgValidateOnly &&
-      !checklistComplete(srgChecklist)
-    ) {
-      setSrgChecklistMessage(
-        "Check all pre-flight checklist items before creating or updating an SRG.",
-      );
-      log("warn", "SRG", "Pre-flight checklist blocked SRG create/update.");
-      return;
-    }
-
     setSrgChecklistMessage("");
     if (
       srgCredentialMode === "accessToken" &&
@@ -826,36 +805,7 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
 
   const visibleData = submittedKind === kind ? data : undefined;
   const visibleError = submittedKind === kind ? error : undefined;
-  const renderChecklist = (
-    checklist: SafetyChecklist,
-    setChecklist: React.Dispatch<React.SetStateAction<SafetyChecklist>>,
-  ) => (
-    <Flex flexDirection="column" gap={8} style={{ ...panelStyle, ...styles.panel, width: "100%" }}>
-      <Heading level={3}>Pre-flight checklist</Heading>
-      {(Object.keys(checklistLabels) as Array<keyof SafetyChecklist>).map((key) => (
-        <label
-          key={key}
-          style={{
-            alignItems: "center",
-            display: "flex",
-            gap: 10,
-          }}
-        >
-          <input
-            type="checkbox"
-            checked={checklist[key]}
-            onChange={(event) =>
-              setChecklist((current) => ({
-                ...current,
-                [key]: event.target.checked,
-              }))
-            }
-          />
-          <Strong>{checklistLabels[key]}</Strong>
-        </label>
-      ))}
-    </Flex>
-  );
+  const descriptionText = pageDescription(activeTab);
   const renderCodeWithCopy = (label: string, value: unknown) => {
     const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
 
@@ -911,11 +861,7 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
         }}
       >
         <Heading>{pageTitle(activeTab)}</Heading>
-        <Paragraph>
-          Send logs and events, create workflows, and import Site Reliability
-          Guardians using Dynatrace SDK calls in the backend. No token is stored
-          in this app.
-        </Paragraph>
+        {descriptionText && <Paragraph>{descriptionText}</Paragraph>}
       </Flex>
 
       {activeTab === "ingest" && (
@@ -1278,7 +1224,7 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
       {activeTab === "workflow" && (
         <Flex flexDirection="column" gap={24} style={{ ...panelStyle, ...styles.panel }}>
           <Flex gap={8} flexFlow="wrap" style={{ ...styles.segment, borderRadius: 8, padding: 6, width: "fit-content" }}>
-            {(["import", "export"] as WorkflowPageMode[]).map((mode) => (
+            {(["create", "download"] as WorkflowPageMode[]).map((mode) => (
               <button
                 key={mode}
                 type="button"
@@ -1291,13 +1237,13 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
                   ...(workflowMode === mode ? styles.selectedButton : styles.idleButton),
                 }}
               >
-                {mode === "import" ? "Import workflow" : "Export workflow"}
+                {mode === "create" ? "Create Workflow" : "Download workflow"}
                 {workflowMode === mode ? "  Selected" : ""}
               </button>
             ))}
           </Flex>
 
-          {workflowMode === "import" ? (
+          {workflowMode === "create" ? (
             <>
               <label style={{ display: "grid", gap: 6 }}>
                 <Strong>Workflow JSON body</Strong>
@@ -1318,24 +1264,13 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
                 <Paragraph>Workflow body must be a JSON object before creating.</Paragraph>
               )}
 
-              {renderChecklist(workflowChecklist, setWorkflowChecklist)}
-
-              <label style={{ alignItems: "center", display: "flex", gap: 10 }}>
-                <input
-                  type="checkbox"
-                  checked={workflowValidateOnly}
-                  onChange={(event) => setWorkflowValidateOnly(event.target.checked)}
-                />
-                <Strong>Validate only</Strong>
-              </label>
-
               <Flex
                 flexDirection="column"
                 gap={8}
                 style={{ ...panelStyle, ...styles.panel, boxSizing: "border-box", width: "100%" }}
               >
                 <Flex justifyContent="space-between" alignItems="center" gap={12}>
-                  <Heading level={3}>Workflow API payload preview</Heading>
+                  <Heading level={3}>Workflow intent payload preview</Heading>
                   <Flex gap={8} alignItems="center">
                     {copyStatus && <Paragraph>{copyStatusMessage()}</Paragraph>}
                     {workflowBody && (
@@ -1375,8 +1310,8 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
               type="button"
               disabled={
                 workflowIsLoading ||
-                (workflowMode === "import" && !workflowJsonIsValid) ||
-                (workflowMode === "export" && !workflowExportId.trim())
+                (workflowMode === "create" && !workflowJsonIsValid) ||
+                (workflowMode === "download" && !workflowExportId.trim())
               }
               onClick={submitWorkflow}
               style={{
@@ -1388,16 +1323,11 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
             >
               {workflowIsLoading
                 ? "Working..."
-                : workflowMode === "export"
-                  ? "Export workflow"
-                  : workflowValidateOnly
-                    ? "Validate workflow"
-                    : "Create or update workflow"}
+                : workflowMode === "download"
+                  ? "Download workflow"
+                  : "Create Workflow"}
             </button>
           </Flex>
-          {workflowChecklistMessage && (
-            renderWarning(workflowChecklistMessage)
-          )}
         </Flex>
       )}
 
@@ -1576,8 +1506,6 @@ export const Home = ({ activeTab = "ingest" }: HomeProps) => {
               {!srgJsonIsValid && (
                 <Paragraph>SRG body must be a JSON object before saving.</Paragraph>
               )}
-
-              {renderChecklist(srgChecklist, setSrgChecklist)}
 
               <label style={{ alignItems: "center", display: "flex", gap: 10 }}>
                 <input
