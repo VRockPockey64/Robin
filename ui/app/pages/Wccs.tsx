@@ -555,6 +555,26 @@ function citySuffix(country: string, city: string) {
   return city.startsWith(prefix) ? city.slice(prefix.length) : city;
 }
 
+function citySuffixParts(country: string, city: string) {
+  return citySuffix(country, city)
+    .split("_")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function normalizedCityValue(country: string, cityValue: string) {
+  if (!cityValue.startsWith(`${country}_`)) {
+    return `${country}_${cityValue}`;
+  }
+
+  const suffixParts = citySuffixParts(country, cityValue);
+  return suffixParts.length > 1 ? `${country}_${suffixParts[0]}` : cityValue;
+}
+
+function normalizedCityList(country: string, values: string[]) {
+  return values.map((value) => normalizedCityValue(country, value)).join(",");
+}
+
 function streetSuffix(city: string, street: string) {
   const prefix = `${city}_`;
   return street.startsWith(prefix) ? street.slice(prefix.length) : street;
@@ -910,9 +930,15 @@ function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
       });
     }
 
+    let hasCityShapeIssue = false;
+
     if (country && city) {
+      let hasCityPrefixIssue = false;
+
       for (const cityValue of cityValues) {
         if (!cityValue.startsWith(`${country}_`)) {
+          hasCityPrefixIssue = true;
+          hasCityShapeIssue = true;
           addIssue(issues, {
             actualValue: city,
             field: "city",
@@ -922,14 +948,35 @@ function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
             recordIndex: index,
             rule: "city-prefix",
             severity: "error",
-            suggestedValue: `${country}_${cityValue}`,
+            suggestedValue: normalizedCityList(country, cityValues),
           });
           break;
         }
       }
+
+      if (!hasCityPrefixIssue) {
+        const cityWithExtraSegment = cityValues.find(
+          (cityValue) => citySuffixParts(country, cityValue).length > 1,
+        );
+
+        if (cityWithExtraSegment) {
+          hasCityShapeIssue = true;
+          addIssue(issues, {
+            actualValue: city,
+            field: "city",
+            location: `payloads[${index}].city`,
+            message:
+              `City must follow \`<country>_<city>\` with no extra underscore segment. ${cityWithExtraSegment} looks like a street/component value.`,
+            recordIndex: index,
+            rule: "city-no-extra-layer",
+            severity: "error",
+            suggestedValue: normalizedCityList(country, cityValues),
+          });
+        }
+      }
     }
 
-    if (country && cityValues.length > 0 && street) {
+    if (!hasCityShapeIssue && country && cityValues.length > 0 && street) {
       const streetCityKeys = streetValues.map((streetValue) =>
         cityKeyFromStreet(streetValue, cityValues),
       );
@@ -993,13 +1040,15 @@ function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
       }
     }
 
-    const extraLayerStreet = streetValues.find((streetValue) => {
-      if (!startsWithAnyCity(streetValue, cityValues)) {
-        return false;
-      }
+    const extraLayerStreet = !hasCityShapeIssue
+      ? streetValues.find((streetValue) => {
+          if (!startsWithAnyCity(streetValue, cityValues)) {
+            return false;
+          }
 
-      return streetSuffixPartsForMatchingCity(streetValue, cityValues).length > 2;
-    });
+          return streetSuffixPartsForMatchingCity(streetValue, cityValues).length > 2;
+        })
+      : undefined;
 
     if (extraLayerStreet) {
       const allowedStreetSuffix = streetSuffixPartsForMatchingCity(
@@ -1024,7 +1073,7 @@ function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
 
     let hasCityCriticalityDiff = false;
 
-    if (cityValues.length > 0 && criticality) {
+    if (!hasCityShapeIssue && cityValues.length > 0 && criticality) {
       const criticalityCityKeys = criticalityValues.map((criticalityValue) =>
         cityKeyFromCriticality(criticalityValue, cityValues),
       );
@@ -1071,7 +1120,7 @@ function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
       }
     }
 
-    if (cityValues.length > 0 && street && criticality) {
+    if (!hasCityShapeIssue && cityValues.length > 0 && street && criticality) {
       const streetCityKeys = streetValues.map((streetValue) =>
         cityKeyFromStreet(streetValue, cityValues),
       );
@@ -1118,7 +1167,7 @@ function validateRecords(records: LibraryRecord[], libraryKind: LibraryKind) {
       });
     }
 
-    if (cityValues.length > 0 && criticality && !hasCityCriticalityDiff) {
+    if (!hasCityShapeIssue && cityValues.length > 0 && criticality && !hasCityCriticalityDiff) {
       for (const criticalityValue of criticalityValues) {
         const criticalitySeverity = severityToken(criticalityValue);
 
