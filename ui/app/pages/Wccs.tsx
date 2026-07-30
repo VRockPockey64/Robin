@@ -1394,10 +1394,12 @@ function getHighServiceWarnings(
 ): HighServiceWarning[] {
   return records.flatMap((record, index) => {
     const criticality = stringField(record, "criticality");
+    const eventName = stringField(record, "eventName");
     const serviceName = stringField(record, "serviceName");
 
     if (
       !serviceName ||
+      (eventName && eventName.trim() === serviceName.trim()) ||
       !splitCommaValues(criticality).some(
         (criticalityValue) => severityToken(criticalityValue) === "HIGH",
       )
@@ -1973,7 +1975,7 @@ export const Wccs = () => {
 
         {libraryKind === "slo" && (
           <Flex flexDirection="column" gap={12}>
-            <Heading level={3}>High criticality service review</Heading>
+            <Heading level={3}>High criticality SLO overview</Heading>
             {highServiceWarnings.length === 0 ? (
               <div
                 style={{
@@ -1983,7 +1985,7 @@ export const Wccs = () => {
                   padding: 12,
                 }}
               >
-                <Strong>No HIGH criticality service mappings found.</Strong>
+                <Strong>No HIGH criticality SLO mappings found.</Strong>
               </div>
             ) : (
               <div
@@ -1991,7 +1993,8 @@ export const Wccs = () => {
                   ...styles.panel,
                   borderRadius: 8,
                   boxSizing: "border-box",
-                  overflowX: "auto",
+                  maxHeight: 330,
+                  overflow: "auto",
                   padding: 12,
                 }}
               >
@@ -2013,8 +2016,12 @@ export const Wccs = () => {
                                 theme === "dark"
                                   ? "1px solid #3b3d55"
                                   : "1px solid #d8dae5",
+                              background: theme === "dark" ? "#18182b" : "#ffffff",
                               padding: "8px 10px",
+                              position: "sticky",
                               textAlign: "left",
+                              top: 0,
+                              zIndex: 1,
                             }}
                           >
                             <Strong>{heading}</Strong>
