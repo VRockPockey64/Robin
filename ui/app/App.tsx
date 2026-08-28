@@ -5,6 +5,7 @@ import { AppConsolePanel, AppConsoleProvider } from "./components/AppConsole";
 import { BrandBanner } from "./components/BrandBanner";
 import { Header } from "./components/Header";
 import { DashboardOwner } from "./pages/DashboardOwner";
+import { DigitalCore } from "./pages/DigitalCore";
 import { Home } from "./pages/Home";
 import { MigrationPrep } from "./pages/MigrationPrep";
 import { Sanitizer } from "./pages/Sanitizer";
@@ -24,6 +25,7 @@ export const App = () => {
             <Route path="/workflow" element={<Home activeTab="workflow" />} />
             <Route path="/srg" element={<Home activeTab="srg" />} />
             <Route path="/dashboard-owner" element={<DashboardOwner />} />
+            <Route path="/digital-core" element={<DigitalCore />} />
             <Route path="/migration-prep" element={<MigrationPrep />} />
             <Route path="/sanitizer" element={<Sanitizer />} />
             <Route path="/wccs" element={<Wccs />} />

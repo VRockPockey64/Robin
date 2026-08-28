@@ -19,6 +19,9 @@ export const Header = () => {
         <AppHeader.NavigationItem as={Link} to="/wccs">
           WCCS
         </AppHeader.NavigationItem>
+        <AppHeader.NavigationItem as={Link} to="/digital-core">
+          Digital Core
+        </AppHeader.NavigationItem>
         <AppHeader.NavigationItem as={Link} to="/dashboard-owner">
           Dashboard Owner
         </AppHeader.NavigationItem>
