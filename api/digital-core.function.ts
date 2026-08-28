@@ -16,12 +16,75 @@ type SloSummary = {
   target: number;
 };
 
+type DigitalCoreFetchError = {
+  code?: number | string;
+  details?: string;
+  message: string;
+  missingPermissions?: string[];
+  missingScopes?: string[];
+  status?: number;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function parseRequest(payload: unknown): DigitalCoreRequest {
   return isRecord(payload) ? payload : {};
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const strings = value.filter((item): item is string => typeof item === "string");
+  return strings.length > 0 ? strings : undefined;
+}
+
+function stringifyDetails(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value, null, 2).slice(0, 6000);
+  } catch {
+    return "Additional error details could not be serialized.";
+  }
+}
+
+function toFetchError(error: unknown): DigitalCoreFetchError {
+  const errorRecord = isRecord(error) ? error : undefined;
+  const response = isRecord(errorRecord?.response)
+    ? errorRecord.response
+    : undefined;
+  const body = isRecord(errorRecord?.body) ? errorRecord.body : undefined;
+  const apiError = isRecord(body?.error) ? body.error : body;
+  const details = isRecord(apiError?.details) ? apiError.details : undefined;
+  const message =
+    (typeof apiError?.message === "string" && apiError.message) ||
+    (error instanceof Error && error.message) ||
+    "Dynatrace did not provide an error message.";
+  const code =
+    typeof apiError?.code === "number" || typeof apiError?.code === "string"
+      ? apiError.code
+      : typeof errorRecord?.name === "string"
+        ? errorRecord.name
+        : undefined;
+
+  return {
+    code,
+    details: stringifyDetails(apiError?.details ?? body),
+    message,
+    missingPermissions: readStringArray(details?.missingPermissions),
+    missingScopes: readStringArray(details?.missingScopes),
+    status: typeof response?.status === "number" ? response.status : undefined,
+  };
 }
 
 function toSloSummary(slo: SLO): SloSummary {
@@ -71,15 +134,33 @@ export default async function (payload: unknown = undefined) {
   void request.action;
   const demo = request.demo === true;
 
-  const slos = await fetchAllSlos(demo);
+  try {
+    const slos = await fetchAllSlos(demo);
 
-  return {
-    demo,
-    fetchedAt: new Date().toISOString(),
-    note: demo
-      ? "Fetched Dynatrace's demo SLO definitions without evaluation."
-      : "Fetched SLO definitions without evaluation using the current user's app permissions.",
-    slos,
-    totalCount: slos.length,
-  };
+    return {
+      demo,
+      fetchedAt: new Date().toISOString(),
+      note: demo
+        ? "Fetched Dynatrace's demo SLO definitions without evaluation."
+        : "Fetched SLO definitions without evaluation using the current user's app permissions.",
+      ok: true as const,
+      slos,
+      totalCount: slos.length,
+    };
+  } catch (error) {
+    const fetchError = toFetchError(error);
+    console.error("Digital Core SLO fetch failed", fetchError);
+
+    // Return the upstream error as data. Throwing here would make the app
+    // function runtime replace it with the generic HTTP 540 failure message.
+    return {
+      demo,
+      error: fetchError,
+      fetchedAt: new Date().toISOString(),
+      note: "The Dynatrace SLO API request failed.",
+      ok: false as const,
+      slos: [],
+      totalCount: 0,
+    };
+  }
 }

@@ -23,8 +23,17 @@ type SloSummary = {
 
 type DigitalCoreResult = {
   demo: boolean;
+  error?: {
+    code?: number | string;
+    details?: string;
+    message: string;
+    missingPermissions?: string[];
+    missingScopes?: string[];
+    status?: number;
+  };
   fetchedAt: string;
   note: string;
+  ok: boolean;
   slos: SloSummary[];
   totalCount: number;
 };
@@ -269,6 +278,29 @@ function isSloType(slo: SloSummary, type: "availability" | "performance") {
   return normalizeForMatch(slo.name).includes(type);
 }
 
+function formatFetchError(result: DigitalCoreResult): string {
+  if (!result.error) {
+    return result.note;
+  }
+
+  return [
+    result.error.message,
+    result.error.status !== undefined
+      ? `HTTP status: ${result.error.status}`
+      : undefined,
+    result.error.code !== undefined ? `Error code: ${result.error.code}` : undefined,
+    result.error.missingScopes?.length
+      ? `Missing scopes: ${result.error.missingScopes.join(", ")}`
+      : undefined,
+    result.error.missingPermissions?.length
+      ? `Missing permissions: ${result.error.missingPermissions.join(", ")}`
+      : undefined,
+    result.error.details ? `Details:\n${result.error.details}` : undefined,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
 function toExportRows(rows: ComparisonRow[]): ComparisonExportRow[] {
   return rows.map((row) => {
     const typedMatchIds = new Set([
@@ -361,7 +393,7 @@ export const DigitalCore = () => {
   useConsoleError("Digital Core SLO fetch", sloError);
 
   const rows: ComparisonRow[] = useMemo(() => {
-    if (!sloData) {
+    if (!sloData?.ok) {
       return [];
     }
 
@@ -382,6 +414,11 @@ export const DigitalCore = () => {
       };
     });
   }, [names, sloData]);
+
+  const parsedNameDebug = useMemo(
+    () => names.map((name) => ({ matchTerms: getMatchTerms(name), name })),
+    [names],
+  );
 
   const matchedCount = rows.filter((row) => row.matches.length > 0).length;
   const unmatchedCount = rows.length - matchedCount;
@@ -406,11 +443,12 @@ export const DigitalCore = () => {
     }
 
     loggedFetchRef.current = sloData.fetchedAt;
-    log(
-      "info",
-      "Digital Core",
-      `Fetched ${sloData.totalCount} SLOs. ${sloData.note}`,
-    );
+    if (!sloData.ok) {
+      log("error", "Digital Core SLO fetch", formatFetchError(sloData));
+      return;
+    }
+
+    log("info", "Digital Core", `Fetched ${sloData.totalCount} SLOs. ${sloData.note}`);
   }, [log, sloData]);
 
   const handleFile = (file: File) => {
@@ -649,7 +687,8 @@ export const DigitalCore = () => {
         {debugMode && (
           <p style={helpTextStyle}>
             Pauses after Step 1 (array creation) and shows you the parsed
-            array before Step 2 (fetch SLOs &amp; compare) runs.
+            array plus the two strongest extracted match terms before Step 2
+            (fetch SLOs &amp; compare) runs.
           </p>
         )}
 
@@ -702,7 +741,15 @@ export const DigitalCore = () => {
               </button>
             </Flex>
             <pre style={{ ...styles.code, ...codeBlockStyle, maxHeight: 200 }}>
-              {names.slice(0, 200).join("\n")}
+              {debugMode
+                ? parsedNameDebug
+                    .slice(0, 200)
+                    .map(
+                      ({ matchTerms, name }) =>
+                        `${name}\n  Match terms: ${matchTerms.join(" + ")}`,
+                    )
+                    .join("\n\n")
+                : names.slice(0, 200).join("\n")}
               {names.length > 200 ? `\n... and ${names.length - 200} more` : ""}
             </pre>
           </Flex>
@@ -728,9 +775,11 @@ export const DigitalCore = () => {
                 Step 2 (fetch SLOs &amp; compare).
               </Strong>
             </div>
-            <Heading level={3}>Step 1 output — parsed array</Heading>
+            <Heading level={3}>
+              Step 1 output — parsed names and extracted match terms
+            </Heading>
             <pre style={{ ...styles.code, ...codeBlockStyle }}>
-              {JSON.stringify(names, null, 2)}
+              {JSON.stringify(parsedNameDebug, null, 2)}
             </pre>
           </Flex>
         )}
@@ -765,7 +814,30 @@ export const DigitalCore = () => {
           </div>
         )}
 
-        {sloData && (
+        {sloData && !sloData.ok && (
+          <div
+            role="alert"
+            style={{
+              ...styles.error,
+              borderRadius: 6,
+              boxSizing: "border-box",
+              padding: 12,
+            }}
+          >
+            <Strong>Could not fetch SLOs from this Dynatrace tenant.</Strong>
+            <pre
+              style={{
+                font: "inherit",
+                marginBottom: 0,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {formatFetchError(sloData)}
+            </pre>
+          </div>
+        )}
+
+        {sloData?.ok && (
           <>
             <div
               role="status"
