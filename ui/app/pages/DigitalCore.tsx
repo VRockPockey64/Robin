@@ -94,6 +94,7 @@ const ignoredMatchTerms = new Set([
   "api",
   "availability",
   "cdk",
+  "cc1",
   "dev",
   "development",
   "e2e",
@@ -449,6 +450,7 @@ function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
     20,
     Math.ceil(index.entries.length * 0.02),
   );
+  const minimumEvidenceRequired = apiAccountIdentifiers.length > 0 ? 1 : 2;
   const evidenceByEntry = new Map<number, MatchTerm[]>();
 
   for (const term of apiTerms) {
@@ -486,7 +488,7 @@ function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
           score,
           slo,
         },
-        eligible: evidence.length >= 2 || hasDistinctiveTerm,
+        eligible: evidence.length >= minimumEvidenceRequired || hasDistinctiveTerm,
       };
     })
     .filter(
@@ -520,7 +522,7 @@ function buildComparisonRow(name: string, index: SloMatchIndex): ComparisonRow {
   const matches = candidates.map((candidate) => candidate.slo);
   const strongestEvidenceCount = candidates[0]?.evidenceTerms.length ?? 0;
   const hasExactCellIdentity = getAccountIdentifiers(name).length > 0;
-  const highConfidenceEvidenceRequired = hasExactCellIdentity ? 2 : 3;
+  const highConfidenceEvidenceRequired = hasExactCellIdentity ? 1 : 3;
   const confidence =
     candidates.length === 0
       ? "none"
