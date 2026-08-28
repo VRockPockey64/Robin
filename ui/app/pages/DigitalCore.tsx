@@ -8,8 +8,12 @@ import {
   Paragraph,
   Strong,
 } from "@dynatrace/strato-components/typography";
-import { useAppFunction } from "@dynatrace-sdk/react-hooks";
-import { useAppConsole, useConsoleError } from "../components/AppConsole";
+import {
+  serviceLevelObjectivesClient,
+  type SLO,
+} from "@dynatrace-sdk/client-classic-environment-v2";
+import { useAppConsole } from "../components/AppConsole";
+import { GetDcSlos } from "./GetDcSlos";
 
 type SloSummary = {
   description: string;
@@ -129,6 +133,93 @@ const helpTextStyle: React.CSSProperties = {
   margin: 0,
   opacity: 0.78,
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const strings = value.filter((item): item is string => typeof item === "string");
+  return strings.length > 0 ? strings : undefined;
+}
+
+function stringifyDetails(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value, null, 2).slice(0, 6000);
+  } catch {
+    return "Additional error details could not be serialized.";
+  }
+}
+
+function toFetchError(error: unknown): NonNullable<DigitalCoreResult["error"]> {
+  const errorRecord = isRecord(error) ? error : undefined;
+  const response = isRecord(errorRecord?.response)
+    ? errorRecord.response
+    : undefined;
+  const body = isRecord(errorRecord?.body) ? errorRecord.body : undefined;
+  const apiError = isRecord(body?.error) ? body.error : body;
+  const details = isRecord(apiError?.details) ? apiError.details : undefined;
+
+  return {
+    code:
+      typeof apiError?.code === "number" || typeof apiError?.code === "string"
+        ? apiError.code
+        : typeof errorRecord?.name === "string"
+          ? errorRecord.name
+          : undefined,
+    details: stringifyDetails(apiError?.details ?? body),
+    message:
+      (typeof apiError?.message === "string" && apiError.message) ||
+      (error instanceof Error && error.message) ||
+      "Dynatrace did not provide an error message.",
+    missingPermissions: readStringArray(details?.missingPermissions),
+    missingScopes: readStringArray(details?.missingScopes),
+    status: typeof response?.status === "number" ? response.status : undefined,
+  };
+}
+
+function toSloSummary(slo: SLO): SloSummary {
+  return {
+    description: slo.description ?? "",
+    enabled: slo.enabled ?? true,
+    evaluatedPercentage: slo.evaluatedPercentage ?? -1,
+    id: slo.id,
+    name: slo.name,
+    status: slo.status ?? "NONE",
+    target: slo.target ?? 0,
+  };
+}
+
+async function fetchAllSlos(demo: boolean): Promise<SloSummary[]> {
+  const all: SloSummary[] = [];
+  let nextPageKey: string | undefined;
+
+  do {
+    const response: Awaited<ReturnType<typeof serviceLevelObjectivesClient.getSlo>> =
+      await serviceLevelObjectivesClient.getSlo(
+        nextPageKey
+          ? { nextPageKey }
+          : { demo, enabledSlos: "all", evaluate: "false", pageSize: 500 },
+      );
+
+    all.push(...(response.slo ?? []).map(toSloSummary));
+    nextPageKey = response.nextPageKey ?? undefined;
+  } while (nextPageKey);
+
+  return all;
+}
 
 function getThemeStyles(theme: "light" | "dark") {
   const dark = theme === "dark";
@@ -379,18 +470,11 @@ export const DigitalCore = () => {
   const [useDemoSlos, setUseDemoSlos] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const copyStatusTimer = useRef<number>();
-  const loggedFetchRef = useRef("");
-
-  const {
-    data: sloData,
-    error: sloError,
-    isLoading: sloIsLoading,
-    refetch: fetchSlos,
-  } = useAppFunction<DigitalCoreResult>(
-    { name: "digital-core", data: { action: "list-slos", demo: useDemoSlos } },
-    { autoFetch: false, autoFetchOnUpdate: false },
-  );
-  useConsoleError("Digital Core SLO fetch", sloError);
+  const [activeSection, setActiveSection] = useState<
+    "slo-status" | "get-dc-slos"
+  >("slo-status");
+  const [sloData, setSloData] = useState<DigitalCoreResult>();
+  const [sloIsLoading, setSloIsLoading] = useState(false);
 
   const rows: ComparisonRow[] = useMemo(() => {
     if (!sloData?.ok) {
@@ -436,20 +520,6 @@ export const DigitalCore = () => {
     () => buildReport(rows, sloData?.totalCount ?? 0),
     [rows, sloData?.totalCount],
   );
-
-  React.useEffect(() => {
-    if (!sloData || sloData.fetchedAt === loggedFetchRef.current) {
-      return;
-    }
-
-    loggedFetchRef.current = sloData.fetchedAt;
-    if (!sloData.ok) {
-      log("error", "Digital Core SLO fetch", formatFetchError(sloData));
-      return;
-    }
-
-    log("info", "Digital Core", `Fetched ${sloData.totalCount} SLOs. ${sloData.note}`);
-  }, [log, sloData]);
 
   const handleFile = (file: File) => {
     setFileName(file.name);
@@ -501,6 +571,41 @@ export const DigitalCore = () => {
     setDebugPaused(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
+    }
+  };
+
+  const fetchSlos = async () => {
+    setSloIsLoading(true);
+    setSloData(undefined);
+
+    try {
+      const slos = await fetchAllSlos(useDemoSlos);
+      const result: DigitalCoreResult = {
+        demo: useDemoSlos,
+        fetchedAt: new Date().toISOString(),
+        note: useDemoSlos
+          ? "Fetched Dynatrace's demo SLO definitions without evaluation."
+          : "Fetched every tenant SLO definition directly from the app UI without evaluation.",
+        ok: true,
+        slos,
+        totalCount: slos.length,
+      };
+      setSloData(result);
+      log("info", "Digital Core", `Fetched ${result.totalCount} SLOs. ${result.note}`);
+    } catch (error) {
+      const result: DigitalCoreResult = {
+        demo: useDemoSlos,
+        error: toFetchError(error),
+        fetchedAt: new Date().toISOString(),
+        note: "The Dynatrace SLO API request failed in the app UI.",
+        ok: false,
+        slos: [],
+        totalCount: 0,
+      };
+      setSloData(result);
+      log("error", "Digital Core SLO fetch", formatFetchError(result));
+    } finally {
+      setSloIsLoading(false);
     }
   };
 
@@ -621,16 +726,32 @@ export const DigitalCore = () => {
         >
           <button
             type="button"
+            onClick={() => setActiveSection("slo-status")}
             style={{
               ...buttonStyle,
-              ...styles.selectedButton,
-              cursor: "default",
+              ...(activeSection === "slo-status"
+                ? styles.selectedButton
+                : styles.idleButton),
             }}
           >
             SLO Status
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveSection("get-dc-slos")}
+            style={{
+              ...buttonStyle,
+              ...(activeSection === "get-dc-slos"
+                ? styles.selectedButton
+                : styles.idleButton),
+            }}
+          >
+            Get DC SLOs
+          </button>
         </Flex>
 
+        {activeSection === "slo-status" ? (
+          <>
         <Flex flexDirection="column" gap={6}>
           <Heading level={2}>SLO Status</Heading>
           <Paragraph>
@@ -800,20 +921,6 @@ export const DigitalCore = () => {
           </button>
         </Flex>
 
-        {sloError && (
-          <div
-            role="alert"
-            style={{
-              ...styles.error,
-              borderRadius: 6,
-              boxSizing: "border-box",
-              padding: 12,
-            }}
-          >
-            <Strong>{sloError.message}</Strong>
-          </div>
-        )}
-
         {sloData && !sloData.ok && (
           <div
             role="alert"
@@ -954,6 +1061,10 @@ export const DigitalCore = () => {
               <pre style={{ ...styles.code, ...codeBlockStyle }}>{report}</pre>
             </Flex>
           </>
+        )}
+          </>
+        ) : (
+          <GetDcSlos />
         )}
       </Flex>
     </Flex>
