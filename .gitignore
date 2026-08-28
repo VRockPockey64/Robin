@@ -12,11 +12,22 @@
 # Dependencies
 /node_modules
 
+# Required local-only project files
+/README.md
+/app.config.json
+/eslint.config.mjs
+/package.json
+/package-lock.json
+
 # Local/internal files
 dt_token.txt
+DT API Master token.txt
 HANDOFF.md
 AGENTS.md
 CLAUDE.md
+
+# Local utility scripts (not part of the app)
+/tools/slo-search/
 
 # IDEs and editors
 /.idea
