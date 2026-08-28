@@ -68,6 +68,7 @@ type SloMatchIndex = {
   documentFrequency: Map<string, number>;
   entries: Array<{
     accountIdentifiers: string[];
+    namespace?: "dc" | "sccg";
     slo: SloSummary;
     terms: Set<string>;
   }>;
@@ -385,6 +386,26 @@ function getAccountIdentifiers(name: string): string[] {
   ].sort();
 }
 
+function getNameNamespace(name: string): "dc" | "sccg" | undefined {
+  const segments = name.split("-").map(normalizeForMatch);
+  if (segments.includes("dc")) {
+    return "dc";
+  }
+
+  if (segments.includes("sccg")) {
+    return "sccg";
+  }
+
+  return undefined;
+}
+
+function hasCompatibleNamespace(
+  apiNamespace: "dc" | "sccg" | undefined,
+  sloNamespace: "dc" | "sccg" | undefined,
+): boolean {
+  return !apiNamespace || !sloNamespace || apiNamespace === sloNamespace;
+}
+
 function hasCompatibleAccountIdentity(
   apiAccountIdentifiers: string[],
   sloAccountIdentifiers: string[],
@@ -403,6 +424,7 @@ function buildSloMatchIndex(slos: SloSummary[]): SloMatchIndex {
   const termToEntryIndexes = new Map<string, number[]>();
   const entries = slos.map((slo, entryIndex) => {
     const accountIdentifiers = getAccountIdentifiers(slo.name);
+    const namespace = getNameNamespace(slo.name);
     const terms = new Set(getNameTerms(slo.name).map((term) => term.normalized));
     for (const term of terms) {
       documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
@@ -411,7 +433,7 @@ function buildSloMatchIndex(slos: SloSummary[]): SloMatchIndex {
       termToEntryIndexes.set(term, entryIndexes);
     }
 
-    return { accountIdentifiers, slo, terms };
+    return { accountIdentifiers, namespace, slo, terms };
   });
 
   return { documentFrequency, entries, termToEntryIndexes };
@@ -419,6 +441,7 @@ function buildSloMatchIndex(slos: SloSummary[]): SloMatchIndex {
 
 function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
   const apiAccountIdentifiers = getAccountIdentifiers(name);
+  const apiNamespace = getNameNamespace(name);
   const apiTerms = getNameTerms(name).filter(
     (term) => !apiAccountIdentifiers.includes(term.normalized),
   );
@@ -438,8 +461,9 @@ function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
 
   const candidates = [...evidenceByEntry]
     .map(([entryIndex, evidence]) => {
-      const { accountIdentifiers, slo } = index.entries[entryIndex];
+      const { accountIdentifiers, namespace, slo } = index.entries[entryIndex];
       if (
+        !hasCompatibleNamespace(apiNamespace, namespace) ||
         !hasCompatibleAccountIdentity(apiAccountIdentifiers, accountIdentifiers)
       ) {
         return undefined;
@@ -495,10 +519,13 @@ function buildComparisonRow(name: string, index: SloMatchIndex): ComparisonRow {
   const candidates = scoreMatches(name, index);
   const matches = candidates.map((candidate) => candidate.slo);
   const strongestEvidenceCount = candidates[0]?.evidenceTerms.length ?? 0;
+  const hasExactCellIdentity = getAccountIdentifiers(name).length > 0;
+  const highConfidenceEvidenceRequired = hasExactCellIdentity ? 2 : 3;
   const confidence =
     candidates.length === 0
       ? "none"
-      : candidates.length <= 6 && strongestEvidenceCount >= 3
+      : candidates.length <= 4 &&
+          strongestEvidenceCount >= highConfidenceEvidenceRequired
         ? "high"
         : "review";
   const matchTerms = [
@@ -703,16 +730,21 @@ export const DigitalCore = () => {
     [reviewSelections, suggestedRows],
   );
 
-  const exceptionRows = suggestedRows.filter((row) => row.confidence !== "high");
+  const reviewerRows = suggestedRows.filter((row) => row.confidence === "review");
   const reviewPageCount = Math.max(
     1,
-    Math.ceil(exceptionRows.length / REVIEW_PAGE_SIZE),
+    Math.ceil(reviewerRows.length / REVIEW_PAGE_SIZE),
   );
-  const visibleReviewerRows = exceptionRows.slice(
+  const visibleReviewerRows = reviewerRows.slice(
     reviewPage * REVIEW_PAGE_SIZE,
     (reviewPage + 1) * REVIEW_PAGE_SIZE,
   );
-  const highConfidenceCount = suggestedRows.length - exceptionRows.length;
+  const highConfidenceCount = suggestedRows.filter(
+    (row) => row.confidence === "high",
+  ).length;
+  const noCandidateCount = suggestedRows.filter(
+    (row) => row.confidence === "none",
+  ).length;
 
   const pendingCount = rows.filter((row) => !row.reviewed).length;
   const unmatchedCount = rows.filter(
@@ -1145,8 +1177,9 @@ export const DigitalCore = () => {
                     <Heading level={3}>Match reviewer</Heading>
                     <Paragraph>
                       {highConfidenceCount} high-confidence match(es) accepted
-                      automatically. {exceptionRows.length} API(s) need review
-                      or have no candidate.
+                      automatically. {reviewerRows.length} ambiguous API(s) need
+                      review. {noCandidateCount} API(s) have no match and are not
+                      shown here.
                     </Paragraph>
                   </div>
                   <p style={helpTextStyle}>
@@ -1273,7 +1306,7 @@ export const DigitalCore = () => {
                   )}
                 </div>
 
-                {exceptionRows.length > REVIEW_PAGE_SIZE && (
+                {reviewerRows.length > REVIEW_PAGE_SIZE && (
                   <Flex
                     justifyContent="space-between"
                     alignItems="center"
