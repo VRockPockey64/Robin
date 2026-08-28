@@ -44,14 +44,34 @@ type DigitalCoreResult = {
 
 type ComparisonRow = {
   availabilityMatches: SloSummary[];
+  candidates: MatchCandidate[];
+  confidence: "high" | "review" | "none";
   matchTerms: string[];
   matches: SloSummary[];
   name: string;
   performanceMatches: SloSummary[];
 };
 
+type MatchCandidate = {
+  evidenceTerms: string[];
+  score: number;
+  slo: SloSummary;
+};
+
+type MatchTerm = {
+  normalized: string;
+  original: string;
+};
+
+type SloMatchIndex = {
+  documentFrequency: Map<string, number>;
+  entries: Array<{ slo: SloSummary; terms: Set<string> }>;
+  termToEntryIndexes: Map<string, number[]>;
+};
+
 type ComparisonExportRow = {
   "API Name": string;
+  "Match Confidence": "High" | "Review" | "None";
   "Match Terms Used": string;
   "Has Availability SLO": "Yes" | "No";
   "Availability SLO Count": number;
@@ -66,12 +86,15 @@ type ComparisonExportRow = {
 
 const ignoredMatchTerms = new Set([
   "api",
+  "availability",
   "cdk",
   "dev",
   "development",
   "e2e",
   "nonprod",
   "nonproduction",
+  "performance",
+  "prd",
   "prod",
   "production",
   "qa",
@@ -83,7 +106,11 @@ const ignoredMatchTerms = new Set([
   "test",
   "testing",
   "uat",
+  "function",
+  "lambda",
 ]);
+
+const REVIEW_PAGE_SIZE = 25;
 
 const fieldStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -323,46 +350,127 @@ function normalizeForMatch(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function getMatchTerms(name: string): string[] {
-  const seen = new Set<string>();
-  const meaningfulTerms = name
-    .split(/[-_\s]+/)
-    .map((term, index) => ({
-      index,
-      normalized: normalizeForMatch(term),
-      original: term.trim(),
-    }))
-    .filter(
-      ({ normalized }) =>
-        normalized.length >= 3 && !ignoredMatchTerms.has(normalized),
-    )
-    .filter(({ normalized }) => {
-      if (seen.has(normalized)) {
-        return false;
+function getNameTerms(name: string): MatchTerm[] {
+  const terms = new Map<string, string>();
+
+  for (const segment of name.split(/[-_\s]+/).filter(Boolean)) {
+    const pieces = segment
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .split(/\s+/)
+      .filter(Boolean);
+
+    for (const value of [segment, ...pieces]) {
+      const normalized = normalizeForMatch(value);
+      if (
+        normalized.length >= 3 &&
+        !ignoredMatchTerms.has(normalized) &&
+        !terms.has(normalized)
+      ) {
+        terms.set(normalized, value);
       }
+    }
+  }
 
-      seen.add(normalized);
-      return true;
-    })
-    .sort(
-      (left, right) =>
-        right.normalized.length - left.normalized.length ||
-        left.index - right.index,
-    )
-    .slice(0, 2)
-    .sort((left, right) => left.index - right.index)
-    .map(({ original }) => original);
-
-  return meaningfulTerms.length > 0 ? meaningfulTerms : [name];
+  return [...terms].map(([normalized, original]) => ({ normalized, original }));
 }
 
-function findMatches(matchTerms: string[], slos: SloSummary[]): SloSummary[] {
-  const normalizedTerms = matchTerms.map(normalizeForMatch).filter(Boolean);
+function buildSloMatchIndex(slos: SloSummary[]): SloMatchIndex {
+  const documentFrequency = new Map<string, number>();
+  const termToEntryIndexes = new Map<string, number[]>();
+  const entries = slos.map((slo, entryIndex) => {
+    const terms = new Set(getNameTerms(slo.name).map((term) => term.normalized));
+    for (const term of terms) {
+      documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
+      const entryIndexes = termToEntryIndexes.get(term) ?? [];
+      entryIndexes.push(entryIndex);
+      termToEntryIndexes.set(term, entryIndexes);
+    }
 
-  return slos.filter((slo) => {
-    const normalizedSloName = normalizeForMatch(slo.name);
-    return normalizedTerms.every((term) => normalizedSloName.includes(term));
+    return { slo, terms };
   });
+
+  return { documentFrequency, entries, termToEntryIndexes };
+}
+
+function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
+  const apiTerms = getNameTerms(name);
+  const maximumDistinctiveFrequency = Math.max(
+    20,
+    Math.ceil(index.entries.length * 0.02),
+  );
+  const evidenceByEntry = new Map<number, MatchTerm[]>();
+
+  for (const term of apiTerms) {
+    for (const entryIndex of index.termToEntryIndexes.get(term.normalized) ?? []) {
+      const evidence = evidenceByEntry.get(entryIndex) ?? [];
+      evidence.push(term);
+      evidenceByEntry.set(entryIndex, evidence);
+    }
+  }
+
+  const candidates = [...evidenceByEntry]
+    .map(([entryIndex, evidence]) => {
+      const { slo } = index.entries[entryIndex];
+      const score = evidence.reduce((total, term) => {
+        const frequency = index.documentFrequency.get(term.normalized) ?? 1;
+        const rarity = Math.log2((index.entries.length + 1) / (frequency + 1)) + 1;
+        const lengthWeight = 1 + Math.min(term.normalized.length, 16) / 16;
+        return total + rarity * lengthWeight;
+      }, 0);
+      const hasDistinctiveTerm = evidence.some((term) => {
+        const frequency = index.documentFrequency.get(term.normalized) ?? 0;
+        return term.normalized.length >= 8 && frequency <= maximumDistinctiveFrequency;
+      });
+
+      return {
+        candidate: {
+          evidenceTerms: evidence.map((term) => term.original),
+          score,
+          slo,
+        },
+        eligible: evidence.length >= 2 || hasDistinctiveTerm,
+      };
+    })
+    .filter((result) => result.eligible)
+    .map((result) => result.candidate)
+    .sort(
+      (left, right) =>
+        right.score - left.score || left.slo.name.localeCompare(right.slo.name),
+    );
+
+  const bestScore = candidates[0]?.score ?? 0;
+  return candidates
+    .filter((candidate) => candidate.score >= bestScore * 0.78)
+    .slice(0, 12);
+}
+
+function buildComparisonRow(name: string, index: SloMatchIndex): ComparisonRow {
+  const candidates = scoreMatches(name, index);
+  const matches = candidates.map((candidate) => candidate.slo);
+  const strongestEvidenceCount = candidates[0]?.evidenceTerms.length ?? 0;
+  const confidence =
+    candidates.length === 0
+      ? "none"
+      : candidates.length <= 6 && strongestEvidenceCount >= 3
+        ? "high"
+        : "review";
+  const matchTerms = [
+    ...new Set(candidates.flatMap((candidate) => candidate.evidenceTerms)),
+  ];
+
+  return {
+    availabilityMatches: matches.filter((slo) =>
+      isSloType(slo, "availability"),
+    ),
+    candidates,
+    confidence,
+    matchTerms,
+    matches,
+    name,
+    performanceMatches: matches.filter((slo) =>
+      isSloType(slo, "performance"),
+    ),
+  };
 }
 
 function isSloType(slo: SloSummary, type: "availability" | "performance") {
@@ -402,6 +510,12 @@ function toExportRows(rows: ComparisonRow[]): ComparisonExportRow[] {
 
     return {
       "API Name": row.name,
+      "Match Confidence":
+        row.confidence === "high"
+          ? "High"
+          : row.confidence === "review"
+            ? "Review"
+            : "None",
       "Match Terms Used": row.matchTerms.join(" + "),
       "Has Availability SLO": row.availabilityMatches.length > 0 ? "Yes" : "No",
       "Availability SLO Count": row.availabilityMatches.length,
@@ -446,6 +560,7 @@ function buildReport(rows: ComparisonRow[], totalSlos: number) {
     ...rows.map(
       (row) => [
         `  ${row.name}`,
+        `    Confidence: ${row.confidence === "high" ? "High" : row.confidence === "review" ? "Review" : "None"}`,
         `    Match terms: ${row.matchTerms.join(" + ")}`,
         `    Availability: ${row.availabilityMatches.length > 0 ? "Yes" : "No"} (${row.availabilityMatches.length})`,
         `    Performance: ${row.performanceMatches.length > 0 ? "Yes" : "No"} (${row.performanceMatches.length})`,
@@ -466,7 +581,11 @@ export const DigitalCore = () => {
   const [names, setNames] = useState<string[]>([]);
   const [parseError, setParseError] = useState("");
   const [debugMode, setDebugMode] = useState(false);
-  const [debugPaused, setDebugPaused] = useState(false);
+  const [reviewSelections, setReviewSelections] = useState<
+    Record<string, string[]>
+  >({});
+  const [reviewPage, setReviewPage] = useState(0);
+  const [showHighConfidence, setShowHighConfidence] = useState(false);
   const [useDemoSlos, setUseDemoSlos] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const copyStatusTimer = useRef<number>();
@@ -476,33 +595,58 @@ export const DigitalCore = () => {
   const [sloData, setSloData] = useState<DigitalCoreResult>();
   const [sloIsLoading, setSloIsLoading] = useState(false);
 
-  const rows: ComparisonRow[] = useMemo(() => {
+  const suggestedRows: ComparisonRow[] = useMemo(() => {
     if (!sloData?.ok) {
       return [];
     }
 
-    return names.map((name) => {
-      const matchTerms = getMatchTerms(name);
-      const matches = findMatches(matchTerms, sloData.slos);
-
-      return {
-        availabilityMatches: matches.filter((slo) =>
-          isSloType(slo, "availability"),
-        ),
-        matchTerms,
-        matches,
-        name,
-        performanceMatches: matches.filter((slo) =>
-          isSloType(slo, "performance"),
-        ),
-      };
-    });
+    const index = buildSloMatchIndex(sloData.slos);
+    return names.map((name) => buildComparisonRow(name, index));
   }, [names, sloData]);
 
-  const parsedNameDebug = useMemo(
-    () => names.map((name) => ({ matchTerms: getMatchTerms(name), name })),
-    [names],
+  const rows: ComparisonRow[] = useMemo(
+    () =>
+      suggestedRows.map((row) => {
+        const selectedIds = reviewSelections[row.name];
+        if (selectedIds === undefined) {
+          return row;
+        }
+
+        const selectedIdSet = new Set(selectedIds);
+        const candidates = row.candidates.filter((candidate) =>
+          selectedIdSet.has(candidate.slo.id),
+        );
+        const matches = candidates.map((candidate) => candidate.slo);
+
+        return {
+          ...row,
+          availabilityMatches: matches.filter((slo) =>
+            isSloType(slo, "availability"),
+          ),
+          candidates,
+          matchTerms: [
+            ...new Set(candidates.flatMap((candidate) => candidate.evidenceTerms)),
+          ],
+          matches,
+          performanceMatches: matches.filter((slo) =>
+            isSloType(slo, "performance"),
+          ),
+        };
+      }),
+    [reviewSelections, suggestedRows],
   );
+
+  const exceptionRows = suggestedRows.filter((row) => row.confidence !== "high");
+  const reviewerRows = showHighConfidence ? suggestedRows : exceptionRows;
+  const reviewPageCount = Math.max(
+    1,
+    Math.ceil(reviewerRows.length / REVIEW_PAGE_SIZE),
+  );
+  const visibleReviewerRows = reviewerRows.slice(
+    reviewPage * REVIEW_PAGE_SIZE,
+    (reviewPage + 1) * REVIEW_PAGE_SIZE,
+  );
+  const highConfidenceCount = suggestedRows.length - exceptionRows.length;
 
   const matchedCount = rows.filter((row) => row.matches.length > 0).length;
   const unmatchedCount = rows.length - matchedCount;
@@ -525,7 +669,8 @@ export const DigitalCore = () => {
     setFileName(file.name);
     setParseError("");
     setNames([]);
-    setDebugPaused(false);
+    setReviewSelections({});
+    setReviewPage(0);
 
     const reader = new FileReader();
     reader.onload = (event) => {
@@ -568,7 +713,8 @@ export const DigitalCore = () => {
     setFileName("");
     setNames([]);
     setParseError("");
-    setDebugPaused(false);
+    setReviewSelections({});
+    setReviewPage(0);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
@@ -577,6 +723,8 @@ export const DigitalCore = () => {
   const fetchSlos = async () => {
     setSloIsLoading(true);
     setSloData(undefined);
+    setReviewSelections({});
+    setReviewPage(0);
 
     try {
       const slos = await fetchAllSlos(useDemoSlos);
@@ -610,23 +758,6 @@ export const DigitalCore = () => {
   };
 
   const runComparison = () => {
-    if (debugMode && !debugPaused) {
-      // Step 1 (array creation) is already done by this point — the file
-      // upload parses it. Pause here and surface the array before doing
-      // anything that talks to the Dynatrace API.
-      setDebugPaused(true);
-      log(
-        "info",
-        "Digital Core",
-        `Debug mode: paused after Step 1 (array creation). ${names.length} name(s) ready — see the array below. Click Continue to run Step 2 (fetch SLOs & compare).`,
-      );
-      return;
-    }
-
-    if (debugMode) {
-      setDebugPaused(false);
-    }
-
     log(
       "info",
       "Digital Core",
@@ -640,11 +771,26 @@ export const DigitalCore = () => {
       return "Fetching SLOs...";
     }
 
-    if (debugMode && debugPaused) {
-      return "Continue";
-    }
-
     return "Fetch SLOs & compare";
+  };
+
+  const setCandidateSelected = (
+    row: ComparisonRow,
+    sloId: string,
+    selected: boolean,
+  ) => {
+    setReviewSelections((current) => {
+      const selectedIds = new Set(
+        current[row.name] ?? row.candidates.map((candidate) => candidate.slo.id),
+      );
+      if (selected) {
+        selectedIds.add(sloId);
+      } else {
+        selectedIds.delete(sloId);
+      }
+
+      return { ...current, [row.name]: [...selectedIds] };
+    });
   };
 
   const copyText = (label: string, value: string) => {
@@ -678,6 +824,7 @@ export const DigitalCore = () => {
     const worksheet = XLSX.utils.json_to_sheet(toExportRows(rows));
     worksheet["!cols"] = [
       { wch: 38 },
+      { wch: 18 },
       { wch: 48 },
       { wch: 22 },
       { wch: 24 },
@@ -758,11 +905,6 @@ export const DigitalCore = () => {
             Upload API or service names and check which ones already have an
             availability or performance SLO configured in this environment.
           </Paragraph>
-          <p style={helpTextStyle}>
-            Matching ignores case and punctuation, removes common environment
-            and platform terms, and requires the two strongest API-name terms
-            to appear in the SLO name.
-          </p>
         </Flex>
 
         <label style={{ display: "grid", gap: 6 }}>
@@ -800,16 +942,15 @@ export const DigitalCore = () => {
             checked={debugMode}
             onChange={(event) => {
               setDebugMode(event.target.checked);
-              setDebugPaused(false);
+              setReviewPage(0);
             }}
           />
           <Strong>Debug mode</Strong>
         </label>
         {debugMode && (
           <p style={helpTextStyle}>
-            Pauses after Step 1 (array creation) and shows you the parsed
-            array plus the two strongest extracted match terms before Step 2
-            (fetch SLOs &amp; compare) runs.
+            After matching, shows only ambiguous or unmatched APIs for review.
+            High-confidence matches stay selected automatically.
           </p>
         )}
 
@@ -862,45 +1003,8 @@ export const DigitalCore = () => {
               </button>
             </Flex>
             <pre style={{ ...styles.code, ...codeBlockStyle, maxHeight: 200 }}>
-              {debugMode
-                ? parsedNameDebug
-                    .slice(0, 200)
-                    .map(
-                      ({ matchTerms, name }) =>
-                        `${name}\n  Match terms: ${matchTerms.join(" + ")}`,
-                    )
-                    .join("\n\n")
-                : names.slice(0, 200).join("\n")}
+              {names.slice(0, 200).join("\n")}
               {names.length > 200 ? `\n... and ${names.length - 200} more` : ""}
-            </pre>
-          </Flex>
-        )}
-
-        {debugMode && debugPaused && (
-          <Flex
-            flexDirection="column"
-            gap={8}
-            style={{ ...panelStyle, ...styles.panel, width: "100%" }}
-          >
-            <div
-              role="status"
-              style={{
-                ...styles.warning,
-                borderRadius: 6,
-                boxSizing: "border-box",
-                padding: 12,
-              }}
-            >
-              <Strong>
-                Paused after Step 1 (array creation). Click Continue to run
-                Step 2 (fetch SLOs &amp; compare).
-              </Strong>
-            </div>
-            <Heading level={3}>
-              Step 1 output — parsed names and extracted match terms
-            </Heading>
-            <pre style={{ ...styles.code, ...codeBlockStyle }}>
-              {JSON.stringify(parsedNameDebug, null, 2)}
             </pre>
           </Flex>
         )}
@@ -963,6 +1067,189 @@ export const DigitalCore = () => {
               </Strong>
             </div>
 
+            {debugMode && (
+              <Flex
+                flexDirection="column"
+                gap={12}
+                style={{ ...panelStyle, ...styles.panel, width: "100%" }}
+              >
+                <Flex
+                  justifyContent="space-between"
+                  alignItems="center"
+                  gap={12}
+                  flexFlow="wrap"
+                >
+                  <div>
+                    <Heading level={3}>Match reviewer</Heading>
+                    <Paragraph>
+                      {highConfidenceCount} high-confidence match(es) accepted
+                      automatically. {exceptionRows.length} API(s) need review
+                      or have no candidate.
+                    </Paragraph>
+                  </div>
+                  <label
+                    style={{ alignItems: "center", display: "flex", gap: 8 }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={showHighConfidence}
+                      onChange={(event) => {
+                        setShowHighConfidence(event.target.checked);
+                        setReviewPage(0);
+                      }}
+                    />
+                    <Strong>Show high-confidence matches</Strong>
+                  </label>
+                </Flex>
+
+                <div
+                  style={{
+                    ...styles.code,
+                    borderRadius: 6,
+                    boxSizing: "border-box",
+                    maxHeight: 520,
+                    overflow: "auto",
+                    padding: 10,
+                  }}
+                >
+                  {visibleReviewerRows.length === 0 ? (
+                    <Paragraph>No exceptions require review.</Paragraph>
+                  ) : (
+                    <Flex flexDirection="column" gap={12}>
+                      {visibleReviewerRows.map((row) => (
+                        <Flex
+                          key={row.name}
+                          flexDirection="column"
+                          gap={8}
+                          style={{
+                            ...styles.panel,
+                            borderRadius: 6,
+                            padding: 12,
+                            width: "100%",
+                          }}
+                        >
+                          <Flex
+                            justifyContent="space-between"
+                            alignItems="center"
+                            gap={12}
+                          >
+                            <Strong>{row.name}</Strong>
+                            <span
+                              style={{
+                                ...(row.confidence === "high"
+                                  ? styles.success
+                                  : row.confidence === "review"
+                                    ? styles.warning
+                                    : styles.error),
+                                borderRadius: 999,
+                                fontSize: 12,
+                                padding: "3px 8px",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
+                              {row.confidence === "high"
+                                ? "High confidence"
+                                : row.confidence === "review"
+                                  ? "Needs review"
+                                  : "No candidate"}
+                            </span>
+                          </Flex>
+
+                          {row.candidates.length === 0 ? (
+                            <p style={helpTextStyle}>
+                              No SLO shared enough meaningful name evidence.
+                            </p>
+                          ) : (
+                            row.candidates.map((candidate) => {
+                              const selectedIds = reviewSelections[row.name];
+                              const checked =
+                                selectedIds === undefined ||
+                                selectedIds.includes(candidate.slo.id);
+
+                              return (
+                                <label
+                                  key={candidate.slo.id}
+                                  style={{
+                                    alignItems: "flex-start",
+                                    display: "flex",
+                                    gap: 10,
+                                  }}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={(event) =>
+                                      setCandidateSelected(
+                                        row,
+                                        candidate.slo.id,
+                                        event.target.checked,
+                                      )
+                                    }
+                                  />
+                                  <span>
+                                    <Strong>{candidate.slo.name}</Strong>
+                                    <br />
+                                    <span style={helpTextStyle}>
+                                      Shared evidence: {candidate.evidenceTerms.join(" + ")}
+                                    </span>
+                                  </span>
+                                </label>
+                              );
+                            })
+                          )}
+                        </Flex>
+                      ))}
+                    </Flex>
+                  )}
+                </div>
+
+                {reviewerRows.length > REVIEW_PAGE_SIZE && (
+                  <Flex
+                    justifyContent="space-between"
+                    alignItems="center"
+                    gap={12}
+                  >
+                    <Paragraph>
+                      Page {reviewPage + 1} of {reviewPageCount} &mdash; showing
+                      at most {REVIEW_PAGE_SIZE} APIs at once
+                    </Paragraph>
+                    <Flex gap={8}>
+                      <button
+                        type="button"
+                        disabled={reviewPage === 0}
+                        onClick={() => setReviewPage((page) => Math.max(0, page - 1))}
+                        style={{
+                          ...buttonStyle,
+                          ...styles.idleButton,
+                          ...(reviewPage === 0 ? disabledButtonStyle : {}),
+                        }}
+                      >
+                        Previous
+                      </button>
+                      <button
+                        type="button"
+                        disabled={reviewPage >= reviewPageCount - 1}
+                        onClick={() =>
+                          setReviewPage((page) =>
+                            Math.min(reviewPageCount - 1, page + 1),
+                          )
+                        }
+                        style={{
+                          ...buttonStyle,
+                          ...styles.idleButton,
+                          ...(reviewPage >= reviewPageCount - 1
+                            ? disabledButtonStyle
+                            : {}),
+                        }}
+                      >
+                        Next
+                      </button>
+                    </Flex>
+                  </Flex>
+                )}
+              </Flex>
+            )}
+
             <Flex
               flexDirection="column"
               gap={8}
@@ -975,7 +1262,8 @@ export const DigitalCore = () => {
                     <tr>
                       {[
                         "Uploaded API name",
-                        "Match terms",
+                        "Confidence",
+                        "Shared evidence",
                         "Availability SLO",
                         "Performance SLO",
                         "Total SLOs",
@@ -1005,7 +1293,30 @@ export const DigitalCore = () => {
                       <tr key={row.name}>
                         <td style={{ padding: "8px 10px" }}>{row.name}</td>
                         <td style={{ padding: "8px 10px" }}>
-                          {row.matchTerms.join(" + ")}
+                          {row.confidence === "high"
+                            ? "High"
+                            : row.confidence === "review"
+                              ? "Review"
+                              : "None"}
+                        </td>
+                        <td style={{ padding: "8px 10px" }}>
+                          <Flex gap={6} flexFlow="wrap">
+                            {row.matchTerms.length > 0
+                              ? row.matchTerms.map((term) => (
+                                  <span
+                                    key={term}
+                                    style={{
+                                      ...styles.segment,
+                                      borderRadius: 999,
+                                      fontSize: 12,
+                                      padding: "3px 8px",
+                                    }}
+                                  >
+                                    {term}
+                                  </span>
+                                ))
+                              : "—"}
+                          </Flex>
                         </td>
                         <td style={{ padding: "8px 10px" }}>
                           {row.availabilityMatches.length > 0
