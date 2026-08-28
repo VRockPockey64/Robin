@@ -358,21 +358,14 @@ function normalizeForMatch(value: string): string {
 function getNameTerms(name: string): MatchTerm[] {
   const terms = new Map<string, string>();
 
-  for (const segment of name.split(/[-_\s]+/).filter(Boolean)) {
-    const pieces = segment
-      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-      .split(/\s+/)
-      .filter(Boolean);
-
-    for (const value of [segment, ...pieces]) {
-      const normalized = normalizeForMatch(value);
-      if (
-        normalized.length >= 3 &&
-        !ignoredMatchTerms.has(normalized) &&
-        !terms.has(normalized)
-      ) {
-        terms.set(normalized, value);
-      }
+  for (const segment of name.split("-").map((value) => value.trim()).filter(Boolean)) {
+    const normalized = normalizeForMatch(segment);
+    if (
+      normalized.length >= 3 &&
+      !ignoredMatchTerms.has(normalized) &&
+      !terms.has(normalized)
+    ) {
+      terms.set(normalized, segment);
     }
   }
 
@@ -383,7 +376,7 @@ function getAccountIdentifiers(name: string): string[] {
   return [
     ...new Set(
       name
-        .split(/[-_\s]+/)
+        .split("-")
         .map(normalizeForMatch)
         // Cell-account identifiers follow the observed ep<cell><number><zone><number>
         // shape, for example epc20n1 or eps10n1. The cell letter is not hardcoded.
@@ -424,18 +417,6 @@ function buildSloMatchIndex(slos: SloSummary[]): SloMatchIndex {
   return { documentFrequency, entries, termToEntryIndexes };
 }
 
-function removeNestedEvidence(terms: MatchTerm[]): MatchTerm[] {
-  return terms.filter(
-    (term) =>
-      !terms.some(
-        (other) =>
-          other.normalized !== term.normalized &&
-          other.normalized.length > term.normalized.length &&
-          other.normalized.includes(term.normalized),
-      ),
-  );
-}
-
 function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
   const apiAccountIdentifiers = getAccountIdentifiers(name);
   const apiTerms = getNameTerms(name).filter(
@@ -464,25 +445,24 @@ function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
         return undefined;
       }
 
-      const distinctEvidence = removeNestedEvidence(evidence);
-      const score = distinctEvidence.reduce((total, term) => {
+      const score = evidence.reduce((total, term) => {
         const frequency = index.documentFrequency.get(term.normalized) ?? 1;
         const rarity = Math.log2((index.entries.length + 1) / (frequency + 1)) + 1;
         const lengthWeight = 1 + Math.min(term.normalized.length, 16) / 16;
         return total + rarity * lengthWeight;
       }, 0);
-      const hasDistinctiveTerm = distinctEvidence.some((term) => {
+      const hasDistinctiveTerm = evidence.some((term) => {
         const frequency = index.documentFrequency.get(term.normalized) ?? 0;
         return term.normalized.length >= 8 && frequency <= maximumDistinctiveFrequency;
       });
 
       return {
         candidate: {
-          evidenceTerms: distinctEvidence.map((term) => term.original),
+          evidenceTerms: evidence.map((term) => term.original),
           score,
           slo,
         },
-        eligible: distinctEvidence.length >= 2 || hasDistinctiveTerm,
+        eligible: evidence.length >= 2 || hasDistinctiveTerm,
       };
     })
     .filter(
