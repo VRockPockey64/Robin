@@ -50,6 +50,7 @@ type ComparisonRow = {
   matches: SloSummary[];
   name: string;
   performanceMatches: SloSummary[];
+  reviewed: boolean;
 };
 
 type MatchCandidate = {
@@ -71,12 +72,12 @@ type SloMatchIndex = {
 
 type ComparisonExportRow = {
   "API Name": string;
-  "Match Confidence": "High" | "Review" | "None";
+  "Match Status": "High confidence" | "Reviewed" | "Pending" | "No match";
   "Match Terms Used": string;
-  "Has Availability SLO": "Yes" | "No";
+  "Has Availability SLO": "Yes" | "No" | "Pending";
   "Availability SLO Count": number;
   "Availability SLO Names": string;
-  "Has Performance SLO": "Yes" | "No";
+  "Has Performance SLO": "Yes" | "No" | "Pending";
   "Performance SLO Count": number;
   "Performance SLO Names": string;
   "Total Matching SLOs": number;
@@ -392,6 +393,18 @@ function buildSloMatchIndex(slos: SloSummary[]): SloMatchIndex {
   return { documentFrequency, entries, termToEntryIndexes };
 }
 
+function removeNestedEvidence(terms: MatchTerm[]): MatchTerm[] {
+  return terms.filter(
+    (term) =>
+      !terms.some(
+        (other) =>
+          other.normalized !== term.normalized &&
+          other.normalized.length > term.normalized.length &&
+          other.normalized.includes(term.normalized),
+      ),
+  );
+}
+
 function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
   const apiTerms = getNameTerms(name);
   const maximumDistinctiveFrequency = Math.max(
@@ -411,24 +424,25 @@ function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
   const candidates = [...evidenceByEntry]
     .map(([entryIndex, evidence]) => {
       const { slo } = index.entries[entryIndex];
-      const score = evidence.reduce((total, term) => {
+      const distinctEvidence = removeNestedEvidence(evidence);
+      const score = distinctEvidence.reduce((total, term) => {
         const frequency = index.documentFrequency.get(term.normalized) ?? 1;
         const rarity = Math.log2((index.entries.length + 1) / (frequency + 1)) + 1;
         const lengthWeight = 1 + Math.min(term.normalized.length, 16) / 16;
         return total + rarity * lengthWeight;
       }, 0);
-      const hasDistinctiveTerm = evidence.some((term) => {
+      const hasDistinctiveTerm = distinctEvidence.some((term) => {
         const frequency = index.documentFrequency.get(term.normalized) ?? 0;
         return term.normalized.length >= 8 && frequency <= maximumDistinctiveFrequency;
       });
 
       return {
         candidate: {
-          evidenceTerms: evidence.map((term) => term.original),
+          evidenceTerms: distinctEvidence.map((term) => term.original),
           score,
           slo,
         },
-        eligible: evidence.length >= 2 || hasDistinctiveTerm,
+        eligible: distinctEvidence.length >= 2 || hasDistinctiveTerm,
       };
     })
     .filter((result) => result.eligible)
@@ -438,10 +452,17 @@ function scoreMatches(name: string, index: SloMatchIndex): MatchCandidate[] {
         right.score - left.score || left.slo.name.localeCompare(right.slo.name),
     );
 
-  const bestScore = candidates[0]?.score ?? 0;
-  return candidates
-    .filter((candidate) => candidate.score >= bestScore * 0.78)
-    .slice(0, 12);
+  const strongestEvidenceCount = candidates.reduce(
+    (maximum, candidate) => Math.max(maximum, candidate.evidenceTerms.length),
+    0,
+  );
+  const strongestCandidates = candidates.filter(
+    (candidate) => candidate.evidenceTerms.length === strongestEvidenceCount,
+  );
+  const bestScore = strongestCandidates[0]?.score ?? 0;
+  return strongestCandidates
+    .filter((candidate) => candidate.score >= bestScore * 0.95)
+    .slice(0, 6);
 }
 
 function buildComparisonRow(name: string, index: SloMatchIndex): ComparisonRow {
@@ -470,6 +491,7 @@ function buildComparisonRow(name: string, index: SloMatchIndex): ComparisonRow {
     performanceMatches: matches.filter((slo) =>
       isSloType(slo, "performance"),
     ),
+    reviewed: confidence !== "review",
   };
 }
 
@@ -510,19 +532,29 @@ function toExportRows(rows: ComparisonRow[]): ComparisonExportRow[] {
 
     return {
       "API Name": row.name,
-      "Match Confidence":
+      "Match Status":
         row.confidence === "high"
-          ? "High"
-          : row.confidence === "review"
-            ? "Review"
-            : "None",
+          ? "High confidence"
+          : !row.reviewed
+            ? "Pending"
+            : row.confidence === "review"
+              ? "Reviewed"
+              : "No match",
       "Match Terms Used": row.matchTerms.join(" + "),
-      "Has Availability SLO": row.availabilityMatches.length > 0 ? "Yes" : "No",
+      "Has Availability SLO": !row.reviewed
+        ? "Pending"
+        : row.availabilityMatches.length > 0
+          ? "Yes"
+          : "No",
       "Availability SLO Count": row.availabilityMatches.length,
       "Availability SLO Names": row.availabilityMatches
         .map((slo) => slo.name)
         .join("; "),
-      "Has Performance SLO": row.performanceMatches.length > 0 ? "Yes" : "No",
+      "Has Performance SLO": !row.reviewed
+        ? "Pending"
+        : row.performanceMatches.length > 0
+          ? "Yes"
+          : "No",
       "Performance SLO Count": row.performanceMatches.length,
       "Performance SLO Names": row.performanceMatches
         .map((slo) => slo.name)
@@ -545,7 +577,10 @@ function buildReport(rows: ComparisonRow[], totalSlos: number) {
     (row) =>
       row.availabilityMatches.length > 0 && row.performanceMatches.length > 0,
   );
-  const withoutSlos = rows.filter((row) => row.matches.length === 0);
+  const pending = rows.filter((row) => !row.reviewed);
+  const withoutSlos = rows.filter(
+    (row) => row.reviewed && row.matches.length === 0,
+  );
 
   return [
     "Digital Core SLO comparison report",
@@ -554,16 +589,17 @@ function buildReport(rows: ComparisonRow[], totalSlos: number) {
     `APIs with availability SLO: ${withAvailability.length}`,
     `APIs with performance SLO: ${withPerformance.length}`,
     `APIs with both: ${withBoth.length}`,
+    `APIs pending review: ${pending.length}`,
     `APIs with no matching SLO: ${withoutSlos.length}`,
     "",
     "Per-API results:",
     ...rows.map(
       (row) => [
         `  ${row.name}`,
-        `    Confidence: ${row.confidence === "high" ? "High" : row.confidence === "review" ? "Review" : "None"}`,
+        `    Status: ${row.confidence === "high" ? "High confidence" : !row.reviewed ? "Pending review" : row.confidence === "review" ? "Reviewed" : "No match"}`,
         `    Match terms: ${row.matchTerms.join(" + ")}`,
-        `    Availability: ${row.availabilityMatches.length > 0 ? "Yes" : "No"} (${row.availabilityMatches.length})`,
-        `    Performance: ${row.performanceMatches.length > 0 ? "Yes" : "No"} (${row.performanceMatches.length})`,
+        `    Availability: ${!row.reviewed ? "Pending" : row.availabilityMatches.length > 0 ? "Yes" : "No"} (${row.availabilityMatches.length})`,
+        `    Performance: ${!row.reviewed ? "Pending" : row.performanceMatches.length > 0 ? "Yes" : "No"} (${row.performanceMatches.length})`,
         `    Total matching SLOs: ${row.matches.length}`,
         ...row.matches.map((match) => `      - ${match.name}`),
       ].join("\n"),
@@ -585,7 +621,6 @@ export const DigitalCore = () => {
     Record<string, string[]>
   >({});
   const [reviewPage, setReviewPage] = useState(0);
-  const [showHighConfidence, setShowHighConfidence] = useState(false);
   const [useDemoSlos, setUseDemoSlos] = useState(false);
   const [copyStatus, setCopyStatus] = useState("");
   const copyStatusTimer = useRef<number>();
@@ -608,11 +643,11 @@ export const DigitalCore = () => {
     () =>
       suggestedRows.map((row) => {
         const selectedIds = reviewSelections[row.name];
-        if (selectedIds === undefined) {
+        if (selectedIds === undefined && row.confidence !== "review") {
           return row;
         }
 
-        const selectedIdSet = new Set(selectedIds);
+        const selectedIdSet = new Set(selectedIds ?? []);
         const candidates = row.candidates.filter((candidate) =>
           selectedIdSet.has(candidate.slo.id),
         );
@@ -624,32 +659,39 @@ export const DigitalCore = () => {
             isSloType(slo, "availability"),
           ),
           candidates,
-          matchTerms: [
-            ...new Set(candidates.flatMap((candidate) => candidate.evidenceTerms)),
-          ],
+          matchTerms:
+            selectedIds === undefined
+              ? row.matchTerms
+              : [
+                  ...new Set(
+                    candidates.flatMap((candidate) => candidate.evidenceTerms),
+                  ),
+                ],
           matches,
           performanceMatches: matches.filter((slo) =>
             isSloType(slo, "performance"),
           ),
+          reviewed: selectedIds !== undefined,
         };
       }),
     [reviewSelections, suggestedRows],
   );
 
   const exceptionRows = suggestedRows.filter((row) => row.confidence !== "high");
-  const reviewerRows = showHighConfidence ? suggestedRows : exceptionRows;
   const reviewPageCount = Math.max(
     1,
-    Math.ceil(reviewerRows.length / REVIEW_PAGE_SIZE),
+    Math.ceil(exceptionRows.length / REVIEW_PAGE_SIZE),
   );
-  const visibleReviewerRows = reviewerRows.slice(
+  const visibleReviewerRows = exceptionRows.slice(
     reviewPage * REVIEW_PAGE_SIZE,
     (reviewPage + 1) * REVIEW_PAGE_SIZE,
   );
   const highConfidenceCount = suggestedRows.length - exceptionRows.length;
 
-  const matchedCount = rows.filter((row) => row.matches.length > 0).length;
-  const unmatchedCount = rows.length - matchedCount;
+  const pendingCount = rows.filter((row) => !row.reviewed).length;
+  const unmatchedCount = rows.filter(
+    (row) => row.reviewed && row.matches.length === 0,
+  ).length;
   const availabilityCount = rows.filter(
     (row) => row.availabilityMatches.length > 0,
   ).length;
@@ -780,9 +822,7 @@ export const DigitalCore = () => {
     selected: boolean,
   ) => {
     setReviewSelections((current) => {
-      const selectedIds = new Set(
-        current[row.name] ?? row.candidates.map((candidate) => candidate.slo.id),
-      );
+      const selectedIds = new Set(current[row.name] ?? []);
       if (selected) {
         selectedIds.add(sloId);
       } else {
@@ -1063,7 +1103,8 @@ export const DigitalCore = () => {
                 {sloData.totalCount} {sloData.demo ? "demo " : ""}SLOs
                 fetched. {availabilityCount} API(s) have availability SLOs, {" "}
                 {performanceCount} have performance SLOs, {completeCount} have
-                both, and {unmatchedCount} have no matching SLO.
+                both, {pendingCount} are pending review, and {unmatchedCount} have
+                no matching SLO.
               </Strong>
             </div>
 
@@ -1073,12 +1114,7 @@ export const DigitalCore = () => {
                 gap={12}
                 style={{ ...panelStyle, ...styles.panel, width: "100%" }}
               >
-                <Flex
-                  justifyContent="space-between"
-                  alignItems="center"
-                  gap={12}
-                  flexFlow="wrap"
-                >
+                <Flex flexDirection="column" gap={4}>
                   <div>
                     <Heading level={3}>Match reviewer</Heading>
                     <Paragraph>
@@ -1087,19 +1123,10 @@ export const DigitalCore = () => {
                       or have no candidate.
                     </Paragraph>
                   </div>
-                  <label
-                    style={{ alignItems: "center", display: "flex", gap: 8 }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={showHighConfidence}
-                      onChange={(event) => {
-                        setShowHighConfidence(event.target.checked);
-                        setReviewPage(0);
-                      }}
-                    />
-                    <Strong>Show high-confidence matches</Strong>
-                  </label>
+                  <p style={helpTextStyle}>
+                    Only uncertain matches appear here. They remain Pending and
+                    are not counted as Yes until you select the correct SLOs.
+                  </p>
                 </Flex>
 
                 <div
@@ -1136,22 +1163,22 @@ export const DigitalCore = () => {
                             <Strong>{row.name}</Strong>
                             <span
                               style={{
-                                ...(row.confidence === "high"
-                                  ? styles.success
-                                  : row.confidence === "review"
+                                ...(row.confidence === "review"
+                                  ? reviewSelections[row.name] === undefined
                                     ? styles.warning
-                                    : styles.error),
+                                    : styles.success
+                                  : styles.error),
                                 borderRadius: 999,
                                 fontSize: 12,
                                 padding: "3px 8px",
                                 whiteSpace: "nowrap",
                               }}
                             >
-                              {row.confidence === "high"
-                                ? "High confidence"
-                                : row.confidence === "review"
-                                  ? "Needs review"
-                                  : "No candidate"}
+                              {row.confidence === "review"
+                                ? reviewSelections[row.name] === undefined
+                                  ? "Pending review"
+                                  : "Reviewed"
+                                : "No candidate"}
                             </span>
                           </Flex>
 
@@ -1160,42 +1187,59 @@ export const DigitalCore = () => {
                               No SLO shared enough meaningful name evidence.
                             </p>
                           ) : (
-                            row.candidates.map((candidate) => {
-                              const selectedIds = reviewSelections[row.name];
-                              const checked =
-                                selectedIds === undefined ||
-                                selectedIds.includes(candidate.slo.id);
+                            <>
+                              {row.candidates.map((candidate) => {
+                                const selectedIds = reviewSelections[row.name];
+                                const checked =
+                                  selectedIds?.includes(candidate.slo.id) ?? false;
 
-                              return (
-                                <label
-                                  key={candidate.slo.id}
-                                  style={{
-                                    alignItems: "flex-start",
-                                    display: "flex",
-                                    gap: 10,
-                                  }}
-                                >
-                                  <input
-                                    type="checkbox"
-                                    checked={checked}
-                                    onChange={(event) =>
-                                      setCandidateSelected(
-                                        row,
-                                        candidate.slo.id,
-                                        event.target.checked,
-                                      )
-                                    }
-                                  />
-                                  <span>
-                                    <Strong>{candidate.slo.name}</Strong>
-                                    <br />
-                                    <span style={helpTextStyle}>
-                                      Shared evidence: {candidate.evidenceTerms.join(" + ")}
+                                return (
+                                  <label
+                                    key={candidate.slo.id}
+                                    style={{
+                                      alignItems: "flex-start",
+                                      display: "flex",
+                                      gap: 10,
+                                    }}
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={(event) =>
+                                        setCandidateSelected(
+                                          row,
+                                          candidate.slo.id,
+                                          event.target.checked,
+                                        )
+                                      }
+                                    />
+                                    <span>
+                                      <Strong>{candidate.slo.name}</Strong>
+                                      <br />
+                                      <span style={helpTextStyle}>
+                                        Shared evidence: {candidate.evidenceTerms.join(" + ")}
+                                      </span>
                                     </span>
-                                  </span>
-                                </label>
-                              );
-                            })
+                                  </label>
+                                );
+                              })}
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setReviewSelections((current) => ({
+                                    ...current,
+                                    [row.name]: [],
+                                  }))
+                                }
+                                style={{
+                                  ...buttonStyle,
+                                  ...styles.idleButton,
+                                  alignSelf: "flex-start",
+                                }}
+                              >
+                                None of these SLOs
+                              </button>
+                            </>
                           )}
                         </Flex>
                       ))}
@@ -1203,7 +1247,7 @@ export const DigitalCore = () => {
                   )}
                 </div>
 
-                {reviewerRows.length > REVIEW_PAGE_SIZE && (
+                {exceptionRows.length > REVIEW_PAGE_SIZE && (
                   <Flex
                     justifyContent="space-between"
                     alignItems="center"
@@ -1262,7 +1306,7 @@ export const DigitalCore = () => {
                     <tr>
                       {[
                         "Uploaded API name",
-                        "Confidence",
+                        "Match status",
                         "Shared evidence",
                         "Availability SLO",
                         "Performance SLO",
@@ -1294,10 +1338,12 @@ export const DigitalCore = () => {
                         <td style={{ padding: "8px 10px" }}>{row.name}</td>
                         <td style={{ padding: "8px 10px" }}>
                           {row.confidence === "high"
-                            ? "High"
-                            : row.confidence === "review"
-                              ? "Review"
-                              : "None"}
+                            ? "High confidence"
+                            : !row.reviewed
+                              ? "Pending review"
+                              : row.confidence === "review"
+                                ? "Reviewed"
+                                : "No match"}
                         </td>
                         <td style={{ padding: "8px 10px" }}>
                           <Flex gap={6} flexFlow="wrap">
@@ -1319,20 +1365,26 @@ export const DigitalCore = () => {
                           </Flex>
                         </td>
                         <td style={{ padding: "8px 10px" }}>
-                          {row.availabilityMatches.length > 0
+                          {!row.reviewed
+                            ? "Pending"
+                            : row.availabilityMatches.length > 0
                             ? `Yes (${row.availabilityMatches.length})`
                             : "No"}
                         </td>
                         <td style={{ padding: "8px 10px" }}>
-                          {row.performanceMatches.length > 0
+                          {!row.reviewed
+                            ? "Pending"
+                            : row.performanceMatches.length > 0
                             ? `Yes (${row.performanceMatches.length})`
                             : "No"}
                         </td>
                         <td style={{ padding: "8px 10px" }}>
-                          {row.matches.length}
+                          {row.reviewed ? row.matches.length : "Pending"}
                         </td>
                         <td style={{ padding: "8px 10px" }}>
-                          {row.matches.length > 0
+                          {!row.reviewed
+                            ? "Pending review"
+                            : row.matches.length > 0
                             ? row.matches
                                 .map((match) => match.name)
                                 .join(", ")
